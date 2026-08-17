@@ -64,32 +64,27 @@ class SyncAttendanceToFactorial implements ShouldQueue
     {
         $workplaceId = $log->biometricSource?->factorial_location_id;
 
-        // OJO: toggle_clock usa nombres de campo distintos a clock_in/clock_out.
-        // Espera "clock_time" (no "now") y no acepta "workplace_id" en el body
-        // (a diferencia de clock_in/clock_out, que sí lo aceptan) — verificado
-        // contra la doc de Factorial para /resources/attendance/shifts/toggle_clock.
         $payload = [
             'employee_id' => $employee->factorial_id,
-            'clock_time'  => $log->occurred_at->format('Y-m-d\TH:i:s'),
+            'now'         => $log->occurred_at->format('Y-m-d\TH:i:s'),
         ];
 
         if ($workplaceId) {
+            $payload['workplace_id']  = $workplaceId;
             $payload['location_type'] = 'office';
         }
 
-        // Usamos toggle_clock en vez de clock_in/clock_out explícito: Factorial decide
-        // solo si el turno debe abrirse o cerrarse según su estado real. Esto nos hace
-        // inmunes a que el check_type venga "mal" un día dado (p. ej. un biométrico que
-        // solo manda check_in) y a que Unresolved Shifts no aplique en días con 0 horas
-        // planificadas (descansos, ausencias aprobadas) — ver hilo de soporte de Factorial
-        // de agosto 2026.
-        if (!in_array($log->check_type, ['check_in', 'check_out', 'break_in', 'break_out'], true)) {
-            $this->fail($log, "check_type no soportado: {$log->check_type}");
-            return;
-        }
-
         try {
-            $response = $service->toggleClock($payload);
+            $response = match ($log->check_type) {
+                'check_in', 'break_out' => $service->clockIn($payload),
+                'check_out', 'break_in' => $service->clockOut($payload),
+                default                 => null,
+            };
+
+            if ($response === null) {
+                $this->fail($log, "check_type no soportado: {$log->check_type}");
+                return;
+            }
 
             $shiftId = $response['id'] ?? null;
             if (!$shiftId) {
@@ -251,15 +246,14 @@ class SyncAttendanceToFactorial implements ShouldQueue
      * Usado para idempotencia: detecta el caso en que el job creó el turno en Factorial
      * pero crasheó antes de actualizar nuestra DB.
      *
-     * Con toggle_clock no podemos asumir de antemano si Factorial tocó clock_in o
-     * clock_out a partir del check_type — decide según el estado real del turno,
-     * que puede no coincidir con lo que el check_type sugiere (es justo el caso que
-     * toggle_clock existe para resolver). Por eso comparamos contra ambos campos.
+     * Para check_in / break_out → busca un turno con clock_in == hora del log.
+     * Para check_out / break_in → busca un turno con clock_out == hora del log.
      */
     private function findMatchingShift(FactorialService $service, int $factorialEmployeeId, AttendanceLog $log): ?array
     {
         $targetDate = $log->occurred_at->format('Y-m-d');
         $logTime    = $log->occurred_at->format('H:i');
+        $field      = in_array($log->check_type, ['check_in', 'break_out']) ? 'clock_in' : 'clock_out';
 
         $shifts = $service->getShifts([
             'employee_ids' => [$factorialEmployeeId],
@@ -270,7 +264,7 @@ class SyncAttendanceToFactorial implements ShouldQueue
         return collect($shifts)->first(
             fn($s) => (int) $s['employee_id'] === $factorialEmployeeId
                    && $s['date'] === $targetDate
-                   && (substr($s['clock_in'] ?? '', 0, 5) === $logTime || substr($s['clock_out'] ?? '', 0, 5) === $logTime)
+                   && substr($s[$field] ?? '', 0, 5) === $logTime
                    && ($s['in_source'] ?? null) === null  // solo turnos creados por nuestra API
         );
     }
