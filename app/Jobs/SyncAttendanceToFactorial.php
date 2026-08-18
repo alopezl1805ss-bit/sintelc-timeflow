@@ -145,6 +145,16 @@ class SyncAttendanceToFactorial implements ShouldQueue
             $openShift = $this->findOpenShift($service, $employee->factorial_id, $log->occurred_at);
 
             if (!$openShift) {
+                // Fallback: si no hay turno abierto, buscar uno cerrado ese mismo día
+                // cuyo clock_out haya sido anterior al ponche real — indica que Factorial
+                // cerró el turno de más temprano (ej. por horario/contrato, o por break mal cerrado).
+                // Correger el clock_out a la hora real es más preciso que fallar.
+                $closedShift = $this->findClosedShiftToCorrect($service, $employee->factorial_id, $log->occurred_at, $log->check_type);
+                if ($closedShift) {
+                    $this->correctClosedShift($log, $employee, $service, $closedShift);
+                    return;
+                }
+
                 $this->fail($log, "Sin turno abierto para sobreescribir. Error original: {$primaryError}");
                 return;
             }
@@ -207,6 +217,112 @@ class SyncAttendanceToFactorial implements ShouldQueue
 
         } catch (\Throwable $e) {
             $this->fail($log, "Directo: {$primaryError} | Overwrite: {$e->getMessage()}");
+            throw $e;
+        }
+    }
+
+    // ── Fallback: corregir turno cerrado de más temprano ────────────────────
+
+    /**
+     * Busca un turno cerrado en la misma fecha (o la anterior, si es nocturno)
+     * cuyo clock_out sea anterior a la hora del ponche real.
+     *
+     * Detecta turnos que Factorial cerró antes de tiempo (p.ej. por horario/contrato,
+     * o por un break sin cierre real), y que la entrada/salida real llegó después.
+     */
+    private function findClosedShiftToCorrect(FactorialService $service, int $factorialEmployeeId, \Carbon\Carbon $logTime, string $checkType): ?array
+    {
+        // Para check_out: buscar un turno cuyo clock_out sea anterior a la hora real
+        // (es decir, ya cerrado cuando la salida debería haber sido después).
+        // Para check_in: buscar un turno del día anterior (turno nocturno cerrado antes del check_in real).
+        $field      = in_array($checkType, ['check_out', 'break_in']) ? 'clock_out' : 'clock_in';
+        $targetDate = $logTime->format('Y-m-d');
+        $logTimeStr = $logTime->format('H:i');
+
+        // Buscar en el mismo día
+        $shifts = $service->getShifts([
+            'employee_ids' => [$factorialEmployeeId],
+            'start_on'     => $targetDate,
+            'end_on'       => $targetDate,
+        ]);
+
+        $candidate = collect($shifts)->filter(
+            fn($s) => (int) $s['employee_id'] === $factorialEmployeeId
+                   && $s['date'] === $targetDate
+                   && $s['clock_out'] !== null  // debe estar cerrado
+                   && substr($s['clock_out'] ?? '', 0, 5) < $logTimeStr  // clock_out antes de la hora real
+        )->first();
+
+        if ($candidate) return $candidate;
+
+        // Para turnos nocturnos (check_in madrugada del 17, pero el turno empezó el 16):
+        // buscar turno del día anterior cuyo clock_out sea de madrugada.
+        if (in_array($checkType, ['check_in', 'break_out']) && (int) substr($logTimeStr, 0, 2) < 6) {
+            $prevDate = $logTime->copy()->subDay()->format('Y-m-d');
+            $shifts = $service->getShifts([
+                'employee_ids' => [$factorialEmployeeId],
+                'start_on'     => $prevDate,
+                'end_on'       => $prevDate,
+            ]);
+
+            return collect($shifts)->filter(
+                fn($s) => (int) $s['employee_id'] === $factorialEmployeeId
+                       && $s['date'] === $prevDate
+                       && $s['clock_out'] !== null
+                       && substr($s['clock_out'] ?? '', 0, 5) >= '20:00'  // cerrado de noche
+            )->first();
+        }
+
+        return null;
+    }
+
+    /**
+     * Corrige un turno cerrado de más temprano, actualizando el clock_out
+     * (o clock_in para break_out) a la hora real del ponche.
+     */
+    private function correctClosedShift(AttendanceLog $log, FactorialEmployee $employee, FactorialService $service, array $shift): void
+    {
+        try {
+            $time = $log->occurred_at->format('H:i:s');
+
+            $updatePayload = match ($log->check_type) {
+                'check_in', 'break_out' => ['clock_in'  => $time],
+                'check_out', 'break_in' => ['clock_out' => $time],
+                default                 => null,
+            };
+
+            if ($updatePayload === null) {
+                $this->fail($log, "check_type no soportado: {$log->check_type}");
+                return;
+            }
+
+            $marker = "Editado por biométrico SFT: {$log->check_type}";
+            $updatePayload['observations'] = $marker;
+
+            $updated = $service->updateShift($shift['id'], $updatePayload);
+            $confirmedId = $updated['id'] ?? null;
+
+            if (!$confirmedId) {
+                $this->fail($log, "Factorial no confirmó la corrección del turno {$shift['id']}");
+                return;
+            }
+
+            $this->markSynced($log, $confirmedId, "corregido (turno cerrado de más temprano)");
+
+            Log::info('SyncAttendanceToFactorial: OK (corrección de cierre anticipado)', [
+                'attendance_log_id'  => $log->id,
+                'check_type'         => $log->check_type,
+                'factorial_shift_id' => $shift['id'],
+                'original_time'      => $shift[$log->check_type === 'check_out' ? 'clock_out' : 'clock_in'],
+                'corrected_time'     => $time,
+            ]);
+
+        } catch (RequestException $e) {
+            $message = $this->extractErrorMessage($e);
+            $this->fail($log, "No se pudo corregir el turno cerrado de más temprano: {$message}");
+            throw $e;
+        } catch (\Throwable $e) {
+            $this->fail($log, "Error corrigiendo turno: {$e->getMessage()}");
             throw $e;
         }
     }
