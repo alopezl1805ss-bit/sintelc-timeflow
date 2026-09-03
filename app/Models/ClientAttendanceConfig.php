@@ -8,6 +8,8 @@ class ClientAttendanceConfig extends Model
 {
     protected $fillable = [
         'client_id',
+        'checkin_only',
+        'auto_close_forgotten_shifts',
         'checkin_id',
         'checkout_id',
         'has_breaks',
@@ -16,7 +18,9 @@ class ClientAttendanceConfig extends Model
     ];
 
     protected $casts = [
-        'has_breaks' => 'boolean',
+        'has_breaks'                  => 'boolean',
+        'checkin_only'                => 'boolean',
+        'auto_close_forgotten_shifts' => 'boolean',
     ];
 
     public function client(): \Illuminate\Database\Eloquent\Relations\BelongsTo

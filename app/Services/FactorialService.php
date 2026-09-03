@@ -170,25 +170,35 @@ class FactorialService
         )->json();
     }
 
+    /**
+     * Construye un query string donde los arrays se codifican como campo[]=valor
+     * (Rails-style), en vez de campo[0]=valor (el default de http_build_query de PHP).
+     * La API de Factorial no acepta el segundo formato — devuelve errores internos
+     * confusos como "undefined method 'map' for an instance of String" o
+     * "Could not coerce value (...) of type (Array) to desired type (Integer)".
+     *
+     * Pasamos el resultado como opción 'query' de tipo string (no array) a Guzzle:
+     * así lo procesa con withQuery(), que codifica [] a %5B%5D correctamente.
+     * Si en cambio pasáramos la URL ya construida, Guzzle podría double-encodear
+     * los %5B%5D a %255B%255D.
+     */
+    private function buildQuery(array $q): string
+    {
+        $parts = [];
+        foreach ($q as $key => $value) {
+            if (is_array($value)) {
+                foreach ($value as $item) {
+                    $parts[] = rawurlencode($key) . '[]=' . rawurlencode((string) $item);
+                }
+            } else {
+                $parts[] = rawurlencode($key) . '=' . rawurlencode((string) $value);
+            }
+        }
+        return implode('&', $parts);
+    }
+
     public function getShifts(array $query = []): array
     {
-        // Construimos el query string como string y lo pasamos como opción 'query' a Guzzle.
-        // Guzzle, al recibir un string, lo procesa con withQuery() que codifica [] a %5B%5D.
-        // Si pasamos la URL ya construida, Guzzle puede double-encodear los %5B%5D a %255B%255D.
-        $buildQuery = function (array $q) {
-            $parts = [];
-            foreach ($q as $key => $value) {
-                if (is_array($value)) {
-                    foreach ($value as $item) {
-                        $parts[] = rawurlencode($key) . '[]=' . rawurlencode((string) $item);
-                    }
-                } else {
-                    $parts[] = rawurlencode($key) . '=' . rawurlencode((string) $value);
-                }
-            }
-            return implode('&', $parts);
-        };
-
         $allShifts = [];
         $offset    = 0;
         $limit     = 100;
@@ -202,7 +212,7 @@ class FactorialService
             $response = $this->request(
                 'get',
                 '/api/2026-04-01/resources/attendance/shifts',
-                ['query' => $buildQuery($pagedQuery)]
+                ['query' => $this->buildQuery($pagedQuery)]
             )->json();
 
             $page  = $response['data'] ?? $response;
@@ -278,5 +288,62 @@ class FactorialService
         );
 
         return true;
+    }
+
+    // Máximo de employee_ids por llamada — mandar todos de un jalón produce
+    // un query string tan largo que revienta con 414 Request-URI Too Large
+    // (encontrado en agosto 2026 con un cliente de 508 empleados activos).
+    private const MAX_EMPLOYEE_IDS_PER_REQUEST = 80;
+
+    /**
+     * Turnos abiertos por employee_ids, resueltos por Factorial directamente
+     * (a diferencia de getShifts(), no requiere filtrar clock_out === null
+     * a mano — el endpoint ya solo devuelve turnos con status "opened").
+     * Verificado contra la API real en agosto 2026 (funciona en 2026-04-01
+     * y en 2026-07-01). Trocea employee_ids en lotes automáticamente.
+     */
+    public function getOpenShifts(array $employeeIds): array
+    {
+        $results = [];
+
+        foreach (array_chunk($employeeIds, self::MAX_EMPLOYEE_IDS_PER_REQUEST) as $chunk) {
+            $response = $this->request(
+                'get',
+                '/api/2026-04-01/resources/attendance/open_shifts',
+                ['query' => $this->buildQuery(['employee_ids' => $chunk])]
+            )->json();
+
+            $results = array_merge($results, $response['data'] ?? []);
+        }
+
+        return $results;
+    }
+
+    /**
+     * Horas planificadas (expected_minutes) por empleado y fecha, calculadas
+     * por Factorial a partir del horario/contrato que el cliente ya configuró
+     * ahí. Evita que le preguntemos al cliente algo que ya definió en Factorial.
+     * Verificado contra la API real en agosto 2026. Trocea employee_ids en
+     * lotes automáticamente (mismo motivo que getOpenShifts()).
+     */
+    public function getEstimatedTimes(array $employeeIds, string $startOn, string $endOn): array
+    {
+        $results = [];
+
+        foreach (array_chunk($employeeIds, self::MAX_EMPLOYEE_IDS_PER_REQUEST) as $chunk) {
+            $response = $this->request(
+                'get',
+                '/api/2026-04-01/resources/attendance/estimated_times',
+                ['query' => $this->buildQuery([
+                    'employee_ids' => $chunk,
+                    'start_on'     => $startOn,
+                    'end_on'       => $endOn,
+                ])]
+            )->json();
+
+            $results = array_merge($results, $response['data'] ?? []);
+        }
+
+        return $results;
     }
 }

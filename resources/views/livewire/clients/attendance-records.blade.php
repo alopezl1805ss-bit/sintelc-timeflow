@@ -216,13 +216,23 @@ new class extends Component {
                             @php
                                 $statusColors = ['pending'=>'bg-yellow-100 text-yellow-800','resolved'=>'bg-blue-100 text-blue-800','synced'=>'bg-green-100 text-green-800','failed'=>'bg-red-100 text-red-800','incomplete'=>'bg-gray-100 text-gray-600','descartado'=>'bg-gray-100 text-gray-400'];
                                 $statusLabels = ['pending'=>'Pendiente','resolved'=>'En proceso','synced'=>'Sincronizado','failed'=>'Fallido','incomplete'=>'Incompleto','descartado'=>'Descartado'];
+                                // Los cierres automáticos (attendance:close-forgotten-shifts) escriben una
+                                // nota con este prefijo — se muestra visible bajo el badge, no solo al pasar
+                                // el mouse, porque son casos que a veces necesitan revisión humana.
+                                $isAutoClose = $log->sync_note && str_starts_with($log->sync_note, \App\Jobs\CloseForgottenShiftJob::NOTE_PREFIX);
+                                $needsReview = $isAutoClose && str_contains($log->sync_note, 'revisar horas');
                             @endphp
                             <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full cursor-default {{ $statusColors[$log->sync_status] ?? 'bg-gray-100 text-gray-800' }}"
                                 @if($log->sync_error) title="{{ $log->sync_error }}"
-                                @elseif($log->sync_note) title="{{ $log->sync_note }}"
+                                @elseif($log->sync_note && !$isAutoClose) title="{{ $log->sync_note }}"
                                 @endif>
                                 {{ $statusLabels[$log->sync_status] ?? $log->sync_status }}
                             </span>
+                            @if($isAutoClose)
+                                <p class="mt-0.5 text-xs {{ $needsReview ? 'text-amber-600 font-medium' : 'text-gray-400' }}">
+                                    {{ $log->sync_note }}
+                                </p>
+                            @endif
                         </td>
                     </tr>
                     @empty

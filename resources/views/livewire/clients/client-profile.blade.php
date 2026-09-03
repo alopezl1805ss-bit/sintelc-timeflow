@@ -30,11 +30,13 @@ new class extends Component {
     public string $contact_email       = '';
 
     // Configuración de asistencia
-    public string $checkin_id  = '0';
-    public string $checkout_id = '1';
-    public bool   $has_breaks  = false;
-    public string $breakin_id  = '';
-    public string $breakout_id = '';
+    public string $checkin_id                    = '0';
+    public string $checkout_id                   = '1';
+    public bool   $has_breaks                    = false;
+    public string $breakin_id                    = '';
+    public string $breakout_id                   = '';
+    public bool   $checkin_only                  = false;
+    public bool   $auto_close_forgotten_shifts   = false;
 
     public function mount(): void
     {
@@ -54,11 +56,25 @@ new class extends Component {
         $this->contact_email       = $this->client->contact_email ?? '';
 
         $config = $this->client->attendanceConfig;
-        $this->checkin_id  = $config?->checkin_id  ?? '0';
-        $this->checkout_id = $config?->checkout_id ?? '1';
-        $this->has_breaks  = (bool) ($config?->has_breaks  ?? false);
-        $this->breakin_id  = $config?->breakin_id  ?? '';
-        $this->breakout_id = $config?->breakout_id ?? '';
+        $this->checkin_id                  = $config?->checkin_id  ?? '0';
+        $this->checkout_id                 = $config?->checkout_id ?? '1';
+        $this->has_breaks                  = (bool) ($config?->has_breaks  ?? false);
+        $this->breakin_id                  = $config?->breakin_id  ?? '';
+        $this->breakout_id                 = $config?->breakout_id ?? '';
+        $this->checkin_only                = (bool) ($config?->checkin_only ?? false);
+        $this->auto_close_forgotten_shifts = (bool) ($config?->auto_close_forgotten_shifts ?? false);
+    }
+
+    /**
+     * checkin_only implica auto_close_forgotten_shifts: si el cliente solo
+     * registra entrada, el cierre automático no es opcional — sin él, el
+     * siguiente check_in de cada empleado falla con "open_shift".
+     */
+    public function updatedCheckinOnly(bool $value): void
+    {
+        if ($value) {
+            $this->auto_close_forgotten_shifts = true;
+        }
     }
 
     public function cancelEdit(): void
@@ -83,6 +99,8 @@ new class extends Component {
             'has_breaks'          => 'boolean',
             'breakin_id'          => $this->has_breaks ? 'required|string|max:10' : 'nullable',
             'breakout_id'         => $this->has_breaks ? 'required|string|max:10' : 'nullable',
+            'checkin_only'                => 'boolean',
+            'auto_close_forgotten_shifts' => 'boolean',
         ]);
 
         $clientData = [
@@ -103,11 +121,13 @@ new class extends Component {
         ClientAttendanceConfig::updateOrCreate(
             ['client_id' => $this->client->id],
             [
-                'checkin_id'  => $this->checkin_id,
-                'checkout_id' => $this->checkout_id,
-                'has_breaks'  => $this->has_breaks,
-                'breakin_id'  => $this->has_breaks ? $this->breakin_id : null,
-                'breakout_id' => $this->has_breaks ? $this->breakout_id : null,
+                'checkin_id'                  => $this->checkin_id,
+                'checkout_id'                 => $this->checkout_id,
+                'has_breaks'                  => $this->has_breaks,
+                'breakin_id'                  => $this->has_breaks ? $this->breakin_id : null,
+                'breakout_id'                 => $this->has_breaks ? $this->breakout_id : null,
+                'checkin_only'                => $this->checkin_only,
+                'auto_close_forgotten_shifts' => $this->checkin_only ? true : $this->auto_close_forgotten_shifts,
             ]
         );
 
@@ -368,6 +388,25 @@ new class extends Component {
                             class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"/>
                         <span class="text-sm text-gray-700">¿Tiene pausas / descansos?</span>
                     </label>
+
+                    <div class="mt-4 pt-4 border-t border-gray-100 space-y-3">
+                        <label class="flex items-start gap-2 cursor-pointer">
+                            <input wire:model.live="checkin_only" type="checkbox"
+                                class="mt-0.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"/>
+                            <span class="text-sm text-gray-700">
+                                Solo registrar entrada (no espera salida del biométrico)
+                                <span class="block text-xs text-gray-400">Cada entrada se cierra automáticamente cuando pasan las horas asignadas al turno (más un margen). Activa el cierre automático de turnos.</span>
+                            </span>
+                        </label>
+                        <label class="flex items-start gap-2 {{ $checkin_only ? 'opacity-50' : 'cursor-pointer' }}">
+                            <input wire:model="auto_close_forgotten_shifts" type="checkbox" @disabled($checkin_only)
+                                class="mt-0.5 rounded border-gray-300 text-indigo-600 focus:ring-indigo-500"/>
+                            <span class="text-sm text-gray-700">
+                                Cerrar automáticamente turnos olvidados (empleado no marcó salida)
+                                <span class="block text-xs text-gray-400">Solo aplica a clientes con entrada y salida normales. Se activa solo si marcas "Solo registrar entrada".</span>
+                            </span>
+                        </label>
+                    </div>
                 @else
                     @php $config = $client->attendanceConfig; @endphp
                     <div class="flex gap-8">
@@ -392,6 +431,16 @@ new class extends Component {
                         <div>
                             <p class="text-xs text-gray-400 mb-0.5">Descansos</p>
                             <p class="text-sm text-gray-700">{{ $config?->has_breaks ? 'Sí' : 'No' }}</p>
+                        </div>
+                    </div>
+                    <div class="mt-4 pt-4 border-t border-gray-100 flex gap-8">
+                        <div>
+                            <p class="text-xs text-gray-400 mb-0.5">Solo entrada</p>
+                            <p class="text-sm text-gray-700">{{ $config?->checkin_only ? 'Sí' : 'No' }}</p>
+                        </div>
+                        <div>
+                            <p class="text-xs text-gray-400 mb-0.5">Cierre automático de turnos</p>
+                            <p class="text-sm text-gray-700">{{ $config?->auto_close_forgotten_shifts ? 'Activo' : 'Inactivo' }}</p>
                         </div>
                     </div>
                 @endif
