@@ -10,6 +10,7 @@ use App\Models\BiometricUserSync;
 use App\Models\Client;
 use App\Models\DeviceUserAssignment;
 use App\Models\FactorialEmployee;
+use App\Services\EmployeeOffboardingService;
 use Livewire\Volt\Component;
 use Livewire\WithFileUploads;
 use Livewire\WithPagination;
@@ -20,13 +21,14 @@ new class extends Component {
     public ?int    $client_id  = null;
     public bool    $clientLocked = false; // true cuando el usuario es cliente (no puede cambiar empresa)
     public string  $search    = '';
-    public string  $tab         = 'biometric'; // 'biometric' | 'factorial' | 'mapping' | 'unresolved'
+    public string  $tab         = 'biometric'; // 'biometric' | 'factorial' | 'mapping' | 'unresolved' | 'archived'
     public string  $scoreFilter  = 'all';       // 'all' | 'perfect' | 'good' | 'low'
     public string  $statusFilter = 'all';       // 'all' | 'mapped' | 'unmapped' (biometric/factorial tabs)
     public ?int    $sourceFilter = null;
-    public array   $selected    = [];          // PINs seleccionados para mapear
+    public array   $selected    = [];          // PINs seleccionados para mapear o dar de baja
     public array   $assignments = [];          // PIN => factorial_employee_id (pendiente de guardar)
     public ?string $mapMessage  = null;        // Resultado del último mapeo
+    public ?string $offboardMessage = null;    // Resultado de la última baja/reactivación
 
     // Modal Agregar Empleado Local
     public bool    $showAddModal    = false;
@@ -268,8 +270,7 @@ new class extends Component {
         $removed = $original->diff($selected);
 
         if ($removed->isNotEmpty()) {
-            $this->manageError = 'La baja física todavía no está habilitada para estos modelos. Puedes agregar destinos sin riesgo, pero no retirar usuarios desde aquí.';
-            return;
+            app(EmployeeOffboardingService::class)->removeFromSources($identity, $removed->values()->all(), auth()->user());
         }
 
         $toAdd = $selected->diff($original);
@@ -336,29 +337,63 @@ new class extends Component {
             return;
         }
 
-        $now = now()->toDateTimeString();
+        $now       = now()->toDateTimeString();
+        $conflicts = [];
 
         // 1. Guardar BiometricUserSync — SELECT explícito para evitar race condition
         foreach ($toMap as $pin => $employeeId) {
             try {
-                $existing = BiometricUserSync::where('biometric_provider_id', $provider->id)
+                // La identidad se busca ANTES por PIN que por empleado: un
+                // empleado dado de alta a mano ("Agregar Empleado") ya tiene
+                // fila con factorial_employee_id NULL ocupando ese PIN, así
+                // que crear otra reventaba el índice único
+                // (biometric_provider_id, external_employee_code). La
+                // excepción se tragaba en el catch y el mapeo se reportaba
+                // como correcto sin haberse guardado nada.
+                $byPin = BiometricUserSync::where('biometric_provider_id', $provider->id)
+                    ->where('external_employee_code', (string) $pin)
+                    ->first();
+
+                $byEmployee = BiometricUserSync::where('biometric_provider_id', $provider->id)
                     ->where('factorial_employee_id', $employeeId)
                     ->first();
 
-                if ($existing) {
-                    // Si ya está mapeado al mismo PIN, no hacer nada
-                    if ((string) $existing->external_employee_code === (string) $pin) {
-                        continue;
+                if ($byPin && $byPin->factorial_employee_id
+                    && (int) $byPin->factorial_employee_id !== $employeeId) {
+                    $conflicts[] = "PIN {$pin} ya pertenece a otra persona";
+                    unset($toMap[$pin]);
+                    continue;
+                }
+
+                if ($byPin && $byEmployee && $byPin->id !== $byEmployee->id) {
+                    $conflicts[] = "PIN {$pin}: ese empleado ya está mapeado al PIN {$byEmployee->external_employee_code}";
+                    unset($toMap[$pin]);
+                    continue;
+                }
+
+                if ($byPin) {
+                    // Identidad local existente: se adopta en vez de duplicar.
+                    if ((int) $byPin->factorial_employee_id !== $employeeId) {
+                        $byPin->update([
+                            'factorial_employee_id' => $employeeId,
+                            'local_name'            => null,
+                            'client_id'             => $this->client_id,
+                            'sync_status'           => 'pending',
+                            'last_attempt_at'       => $now,
+                        ]);
                     }
-                    // Si está mapeado a otro PIN, actualizar (el admin decidió cambiar)
-                    $existing->update([
-                        'external_employee_code' => $pin,
+                    $identity = $byPin;
+                } elseif ($byEmployee) {
+                    // Estaba mapeado a otro PIN: el admin decidió cambiarlo.
+                    $byEmployee->update([
+                        'external_employee_code' => (string) $pin,
                         'client_id'              => $this->client_id,
                         'sync_status'            => 'pending',
                         'last_attempt_at'        => $now,
                     ]);
+                    $identity = $byEmployee;
                 } else {
-                    BiometricUserSync::create([
+                    $identity = BiometricUserSync::create([
                         'biometric_provider_id'  => $provider->id,
                         'factorial_employee_id'  => $employeeId,
                         'external_employee_code' => $pin,
@@ -367,7 +402,15 @@ new class extends Component {
                         'last_attempt_at'        => $now,
                     ]);
                 }
+
+                // Las asignaciones a dispositivo creadas mientras la identidad
+                // era local apuntan a factorial_employee_id NULL; sin esto la
+                // pestaña "Biométrico" seguiría mostrando el PIN sin mapear.
+                DeviceUserAssignment::where('biometric_user_sync_id', $identity->id)
+                    ->update(['factorial_employee_id' => $employeeId]);
             } catch (\Throwable $e) {
+                unset($toMap[$pin]);
+                $conflicts[] = "PIN {$pin}: no se pudo guardar";
                 \Illuminate\Support\Facades\Log::error('mapSelected: error al guardar sync', [
                     'pin'        => $pin,
                     'employeeId' => $employeeId,
@@ -399,10 +442,55 @@ new class extends Component {
         }
 
         $saved   = count($toMap);
-        $skipped = count($this->selected) - $saved;
+        $skipped = count($this->selected) - $saved - count($conflicts);
 
-        $this->mapMessage = "✓ {$saved} mapeado(s)" . ($skipped > 0 ? " · ⚠ {$skipped} omitido(s) sin asignación" : "");
+        $this->mapMessage = "✓ {$saved} mapeado(s)"
+            . ($skipped > 0 ? " · ⚠ {$skipped} omitido(s) sin asignación" : '')
+            . ($conflicts !== []
+                ? ' · ⚠ ' . implode(' · ', array_slice($conflicts, 0, 3))
+                    . (count($conflicts) > 3 ? ' (+' . (count($conflicts) - 3) . ')' : '')
+                : '');
         $this->selected = [];
+    }
+
+    /**
+     * Baja general (Alcance 1.3/1.6) de todos los empleados seleccionados:
+     * se solicita su baja de cada dispositivo donde estén presentes y se
+     * archivan en FlowTime. No borra el registro ni su histórico.
+     */
+    public function archiveSelected(): void
+    {
+        $this->authorizeSelectedClient();
+        if (!$this->client_id || empty($this->selected)) return;
+
+        $identities = BiometricUserSync::query()
+            ->where('client_id', $this->client_id)
+            ->whereIn('external_employee_code', $this->selected)
+            ->where('status', '!=', 'archived')
+            ->get();
+
+        $service = app(EmployeeOffboardingService::class);
+        foreach ($identities as $identity) {
+            $service->archive($identity, auth()->user());
+        }
+
+        $this->offboardMessage = "✓ {$identities->count()} empleado(s) dado(s) de baja";
+        $this->selected = [];
+    }
+
+    public function reactivateIdentity(string $pin): void
+    {
+        $this->authorizeSelectedClient();
+        abort_unless($this->client_id, 422);
+
+        $identity = BiometricUserSync::query()
+            ->where('client_id', $this->client_id)
+            ->where('external_employee_code', $pin)
+            ->firstOrFail();
+
+        app(EmployeeOffboardingService::class)->reactivate($identity);
+
+        $this->offboardMessage = "✓ {$pin} reactivado — vuelve a aparecer en la lista de empleados";
     }
 
     public function with(): array
@@ -544,6 +632,7 @@ new class extends Component {
 
             if ($this->client_id) {
                 $biometricSources = BiometricSource::where('client_id', $this->client_id)
+                    ->where('status', '!=', 'virtual')
                     ->when($this->sourceFilter, fn($query) => $query->whereKey($this->sourceFilter))
                     ->orderBy('name')
                     ->get();
@@ -556,14 +645,20 @@ new class extends Component {
                 $employees = FactorialEmployee::where('client_id', $this->client_id)
                     ->get(['id', 'factorial_id', 'full_name'])
                     ->keyBy('id');
-                $identityNames = BiometricUserSync::query()
+                $identities = BiometricUserSync::query()
                     ->where('client_id', $this->client_id)
                     ->with('factorialEmployee:id,full_name')
-                    ->get()
-                    ->mapWithKeys(fn($identity) => [
-                        (string) $identity->external_employee_code => $identity->factorialEmployee?->full_name
-                            ?? $identity->local_name,
-                    ]);
+                    ->get();
+                $identityNames = $identities->mapWithKeys(fn($identity) => [
+                    (string) $identity->external_employee_code => $identity->factorialEmployee?->full_name
+                        ?? $identity->local_name,
+                ]);
+                // Los archivados (Alcance 1.3) no aparecen en la lista activa —
+                // se ven en la pestaña "Archivados".
+                $archivedPins = $identities
+                    ->where('status', 'archived')
+                    ->pluck('external_employee_code')
+                    ->map(fn($pin) => (string) $pin);
 
                 $biometricSources->each(function ($source) use (&$biometricUsers, $mappings, $employees, $identityNames) {
                     foreach ($source->device_users ?? [] as $u) {
@@ -613,6 +708,8 @@ new class extends Component {
                         || stripos($user['name'] ?? '', $this->search) !== false
                     );
                 }
+
+                $biometricUsers = $biometricUsers->reject(fn($user) => $archivedPins->contains($user['pin']));
 
                 $totalDeviceCount = $biometricSources->count();
                 $biometricUsers = $biometricUsers
@@ -699,6 +796,40 @@ new class extends Component {
             ];
         }
 
+        // ── Tab: Archivados (Alcance 1.3/1.6) ───────────────────────
+        if ($this->tab === 'archived') {
+            $archived = collect();
+
+            if ($this->client_id) {
+                $archived = BiometricUserSync::query()
+                    ->where('client_id', $this->client_id)
+                    ->where('status', 'archived')
+                    ->with('factorialEmployee:id,full_name')
+                    ->when($this->search, fn($q) => $q->where(function ($q2) {
+                        $q2->where('external_employee_code', 'like', "%{$this->search}%")
+                           ->orWhere('local_name', 'like', "%{$this->search}%");
+                    }))
+                    ->orderByDesc('archived_at')
+                    ->paginate(20);
+            }
+
+            return [
+                'unmappedUsers'    => collect(),
+                'allSelected'      => false,
+                'totalUnmapped'    => 0,
+                'biometricUsers'   => collect(),
+                'biometricSources' => collect(),
+                'archived'         => $archived,
+                'employees'        => collect(),
+                'unresolved'       => collect(),
+                'unresolvedCount'  => 0,
+                'clients'          => $clients,
+                'vendorName'       => 'Biométrico',
+                'mappedEmployeeIds'=> collect(),
+                'biometricIds'     => collect(),
+            ];
+        }
+
         // ── Tab: Empleados Factorial ────────────────────────────────
         if (!$this->client_id) {
             return ['unmappedUsers' => collect(), 'allSelected' => false, 'totalUnmapped' => 0, 'biometricSources' => collect(), 'biometricTotalCount' => 0, 'biometricMappedCount' => 0, 'employees' => collect(), 'unresolved' => collect(), 'unresolvedCount' => 0, 'clients' => $clients, 'vendorName' => 'Biométrico', 'mappedEmployeeIds' => collect(), 'biometricIds' => collect(), 'biometricSyncs' => collect(), 'sourcesPerProvider' => collect(), 'totalSources' => 0];
@@ -723,7 +854,7 @@ new class extends Component {
         $biometricIds      = $biometricSyncs->pluck('external_employee_code', 'factorial_employee_id');
         $mappedEmployeeIds = $biometricIds->flip();
 
-        $allSources         = BiometricSource::where('client_id', $this->client_id)->get(['biometric_provider_id', 'name']);
+        $allSources         = BiometricSource::where('client_id', $this->client_id)->where('status', '!=', 'virtual')->get(['biometric_provider_id', 'name']);
         $totalSources       = $allSources->count();
         $sourcesPerProvider = $allSources->groupBy('biometric_provider_id')->map(fn($s) => $s->pluck('name'));
 
@@ -1163,6 +1294,10 @@ new class extends Component {
                         class="py-3 px-1 text-sm font-medium border-b-2 transition-colors {{ $tab === 'mapping' ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300' }}">
                         Mapping
                     </button>
+                    <button wire:click="$set('tab', 'archived')"
+                        class="py-3 px-1 text-sm font-medium border-b-2 transition-colors {{ $tab === 'archived' ? 'border-indigo-500 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300' }}">
+                        Archivados
+                    </button>
                 </div>
                 <button wire:click="syncAll" wire:loading.attr="disabled" wire:target="syncAll"
                     class="inline-flex items-center gap-1.5 text-xs font-medium text-indigo-600 hover:text-indigo-800 disabled:opacity-50 transition pb-px">
@@ -1238,12 +1373,23 @@ new class extends Component {
                         {{ $biometricSources->first()?->name }} · quitar filtro ×
                     </button>
                     @endif
+                    @if($offboardMessage)
+                    <span class="text-xs text-emerald-600 font-medium">{{ $offboardMessage }}</span>
+                    @endif
                     <span class="text-xs text-gray-400">
                         {{ $biometricMappedCount }} de {{ $biometricTotalCount }} empleado(s) mapeados
                         @if($biometricPendingCount > 0)
                             · <span class="font-medium text-amber-600">{{ $biometricPendingCount }} pendientes</span>
                         @endif
                     </span>
+                    @if(count($selected) > 0)
+                    <button wire:click="archiveSelected" wire:loading.attr="disabled"
+                        wire:confirm="¿Dar de baja a {{ count($selected) }} empleado(s)? Se solicitará su baja de todos sus dispositivos y se archivarán — su histórico de asistencia se conserva."
+                        class="inline-flex items-center gap-1.5 text-xs font-semibold bg-red-50 hover:bg-red-100 text-red-700 px-3 py-1.5 rounded border border-red-200 transition disabled:opacity-50">
+                        <span wire:loading.remove wire:target="archiveSelected">Dar de baja {{ count($selected) }} seleccionado(s)</span>
+                        <span wire:loading wire:target="archiveSelected">Procesando…</span>
+                    </button>
+                    @endif
                     <button wire:click="openAddModal"
                         class="inline-flex items-center gap-1.5 text-xs font-semibold bg-indigo-600 hover:bg-indigo-700 text-white px-3 py-1.5 rounded transition">
                         <svg class="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1254,6 +1400,13 @@ new class extends Component {
                 @elseif($tab === 'factorial')
                     <span class="text-xs text-gray-400">
                         {{ $mappedEmployeeIds->count() }} de {{ $employees instanceof \Illuminate\Pagination\LengthAwarePaginator ? $employees->total() : $employees->count() }} empleado(s) mapeados
+                    </span>
+                @elseif($tab === 'archived')
+                    @if($offboardMessage)
+                    <span class="text-xs text-emerald-600 font-medium">{{ $offboardMessage }}</span>
+                    @endif
+                    <span class="text-xs text-gray-400">
+                        {{ $archived instanceof \Illuminate\Pagination\LengthAwarePaginator ? $archived->total() : $archived->count() }} archivado(s)
                     </span>
                 @endif
             </div>
@@ -1316,6 +1469,12 @@ new class extends Component {
         <table class="min-w-full divide-y divide-gray-200">
             <thead class="bg-gray-50">
                 <tr>
+                    <th class="px-4 py-3 w-10">
+                        <input type="checkbox"
+                            @checked($biometricUsers->isNotEmpty() && collect($biometricUsers->items())->every(fn($u) => in_array($u['pin'], $selected)))
+                            class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+                            @change="$wire.setSelectAll({{ Js::from(collect($biometricUsers->items())->pluck('pin')->all()) }}, $event.target.checked)">
+                    </th>
                     <th class="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
                     <th class="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nombre en dispositivo</th>
                     <th class="px-5 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Biométricos</th>
@@ -1327,7 +1486,15 @@ new class extends Component {
             </thead>
             <tbody class="bg-white divide-y divide-gray-200">
                 @forelse($biometricUsers as $user)
-                <tr class="hover:bg-gray-50">
+                @php $isRowSelected = in_array($user['pin'], $selected); @endphp
+                <tr class="{{ $isRowSelected ? 'bg-red-50' : 'hover:bg-gray-50' }}" wire:key="biorow-{{ $user['pin'] }}">
+                    <td class="px-4 py-3">
+                        <input type="checkbox"
+                            wire:key="biocb-{{ $user['pin'] }}"
+                            @checked($isRowSelected)
+                            wire:change="@if($isRowSelected) setSelectAll(['{{ $user['pin'] }}'], false) @else setSelectAll(['{{ $user['pin'] }}'], true) @endif"
+                            class="rounded border-gray-300 text-indigo-600 focus:ring-indigo-500 cursor-pointer">
+                    </td>
                     <td class="px-5 py-3 whitespace-nowrap font-mono text-sm font-semibold text-gray-900">
                         {{ $user['pin'] }}
                     </td>
@@ -1389,7 +1556,7 @@ new class extends Component {
                 </tr>
                 @empty
                 <tr>
-                    <td colspan="7" class="px-6 py-10 text-center text-sm text-gray-500">
+                    <td colspan="8" class="px-6 py-10 text-center text-sm text-gray-500">
                         No hay empleados registrados en el biométrico.
                     </td>
                 </tr>
@@ -1400,6 +1567,57 @@ new class extends Component {
         @if($biometricUsers instanceof \Illuminate\Pagination\LengthAwarePaginator && $biometricUsers->hasPages())
         <div class="px-6 py-4 border-t border-gray-200">
             {{ $biometricUsers->links() }}
+        </div>
+        @endif
+    </div>
+    @endif
+
+    {{-- TAB: Archivados --}}
+    @if($tab === 'archived')
+    <div class="bg-white shadow rounded-lg overflow-hidden">
+        <div class="overflow-x-auto">
+        <table class="min-w-full divide-y divide-gray-200">
+            <thead class="bg-gray-50">
+                <tr>
+                    <th class="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">ID</th>
+                    <th class="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Nombre</th>
+                    <th class="px-5 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Archivado</th>
+                    <th class="px-5 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">Acciones</th>
+                </tr>
+            </thead>
+            <tbody class="bg-white divide-y divide-gray-200">
+                @forelse($archived as $identity)
+                <tr class="hover:bg-gray-50" wire:key="archived-{{ $identity->external_employee_code }}">
+                    <td class="px-5 py-3 whitespace-nowrap font-mono text-sm font-semibold text-gray-900">
+                        {{ $identity->external_employee_code }}
+                    </td>
+                    <td class="px-5 py-3 whitespace-nowrap text-sm text-gray-700">
+                        {{ $identity->factorialEmployee?->full_name ?? $identity->local_name ?? '—' }}
+                    </td>
+                    <td class="px-5 py-3 whitespace-nowrap text-sm text-gray-500">
+                        {{ $identity->archived_at?->format('d/m/Y H:i') ?? '—' }}
+                    </td>
+                    <td class="px-5 py-3 whitespace-nowrap text-center">
+                        <button wire:click="reactivateIdentity('{{ $identity->external_employee_code }}')"
+                            wire:confirm="¿Reactivar a este empleado? Volverá a aparecer en la lista de empleados — no se reenvía automáticamente a ningún dispositivo."
+                            class="text-xs font-medium text-indigo-600 hover:text-indigo-800">
+                            Reactivar
+                        </button>
+                    </td>
+                </tr>
+                @empty
+                <tr>
+                    <td colspan="4" class="px-6 py-10 text-center text-sm text-gray-500">
+                        No hay empleados archivados.
+                    </td>
+                </tr>
+                @endforelse
+            </tbody>
+        </table>
+        </div>
+        @if($archived instanceof \Illuminate\Pagination\LengthAwarePaginator && $archived->hasPages())
+        <div class="px-6 py-4 border-t border-gray-200">
+            {{ $archived->links() }}
         </div>
         @endif
     </div>

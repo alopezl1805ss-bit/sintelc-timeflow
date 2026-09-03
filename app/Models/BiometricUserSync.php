@@ -17,6 +17,8 @@ class BiometricUserSync extends Model
         'provider_user_id',
         'sync_status',
         'sync_error',
+        'status',
+        'archived_at',
         'last_attempt_at',
         'synced_at',
         'raw_request',
@@ -26,6 +28,7 @@ class BiometricUserSync extends Model
     protected $casts = [
         'last_attempt_at' => 'datetime',
         'synced_at' => 'datetime',
+        'archived_at' => 'datetime',
         'raw_request' => 'array',
         'raw_response' => 'array',
     ];

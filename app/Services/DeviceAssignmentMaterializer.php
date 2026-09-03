@@ -48,6 +48,15 @@ class DeviceAssignmentMaterializer
                     'pin' => (string) $pin,
                 ]);
 
+                // Se pidió la baja de este PIN (Alcance 1.3) — que el
+                // dispositivo todavía lo reporte no es evidencia de que deba
+                // re-agregarse, solo de que el delete_user no se ha aplicado
+                // aún (o el reporte es de antes del comando). No pisamos la
+                // intención explícita del usuario.
+                if ($assignment->exists && $assignment->desired_state === 'absent') {
+                    continue;
+                }
+
                 if (!$assignment->exists) {
                     $created++;
                 }

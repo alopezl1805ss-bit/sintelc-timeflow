@@ -83,6 +83,105 @@ class DeviceSyncBatchService
         });
     }
 
+    /**
+     * Baja de uno o varios PINs de un dispositivo específico (Alcance 1.3).
+     * A diferencia de create(), no toca el mapeo con Factorial ni la
+     * identidad (BiometricUserSync) — solo el estado deseado de la
+     * asignación a ESTE dispositivo. Reutiliza el mismo pipeline de
+     * DeviceCommand/DeviceCommandLifecycleService que el alta: getRequest()
+     * no le importa el command_type, solo lo encola y lo manda tal cual.
+     */
+    public function createRemoval(
+        BiometricSource $source,
+        array $pins,
+        ?User $creator = null,
+        string $origin = 'manual'
+    ): DeviceSyncBatch {
+        abort_unless($source->client_id && $source->biometric_provider_id, 422);
+
+        $pins = collect($pins)->map(fn($pin) => trim((string) $pin))->filter()->unique()->values();
+        abort_if($pins->isEmpty(), 422, 'Selecciona al menos un empleado para dar de baja.');
+
+        return DB::transaction(function () use ($source, $pins, $creator, $origin) {
+            $source = BiometricSource::query()->lockForUpdate()->findOrFail($source->id);
+
+            $batch = DeviceSyncBatch::create([
+                'uuid' => (string) Str::uuid(),
+                'client_id' => $source->client_id,
+                'created_by' => $creator?->id,
+                'type' => 'removal',
+                'origin' => $origin,
+                'status' => 'preparing',
+                'options' => [],
+                'started_at' => now(),
+            ]);
+
+            $nextSequence = (int) DeviceCommand::where('biometric_source_id', $source->id)
+                ->max('command_seq') + 1;
+
+            $assignments = DeviceUserAssignment::query()
+                ->where('biometric_source_id', $source->id)
+                ->whereIn('pin', $pins)
+                ->where('desired_state', 'present')
+                ->get()
+                ->keyBy('pin');
+
+            foreach ($pins as $pin) {
+                $assignment = $assignments->get($pin);
+                if (!$assignment) {
+                    // No hay nada que dar de baja para este PIN en este
+                    // dispositivo (ya no estaba asignado) — no es un error,
+                    // simplemente no se genera item ni comando.
+                    continue;
+                }
+
+                $item = DeviceSyncItem::create([
+                    'device_sync_batch_id' => $batch->id,
+                    'biometric_source_id' => $source->id,
+                    'device_user_assignment_id' => $assignment->id,
+                    'factorial_employee_id' => $assignment->factorial_employee_id,
+                    'action' => 'remove',
+                    'pin' => $pin,
+                    'name' => $assignment->name ?: $pin,
+                    'syncs_with_factorial' => false,
+                    'status' => 'planned',
+                ]);
+
+                $activeItem = DeviceSyncItem::query()
+                    ->where('device_user_assignment_id', $assignment->id)
+                    ->whereKeyNot($item->id)
+                    ->whereIn('status', ['queued', 'sent', 'acknowledged'])
+                    ->exists();
+
+                if ($activeItem) {
+                    $item->update([
+                        'status' => 'conflict',
+                        'error' => 'Ya existe una operación activa para este PIN y dispositivo.',
+                    ]);
+                    continue;
+                }
+
+                DeviceCommand::create([
+                    'biometric_source_id' => $source->id,
+                    'device_sync_item_id' => $item->id,
+                    'command_seq' => $nextSequence,
+                    'command_type' => 'delete_user',
+                    'idempotency_key' => "device-user-removal:{$batch->uuid}:{$source->id}:{$pin}",
+                    'payload' => $this->deletePayload($pin),
+                    'status' => 'pending',
+                ]);
+                $nextSequence++;
+
+                $item->update(['status' => 'queued']);
+                $assignment->update(['desired_state' => 'absent', 'sync_status' => 'queued', 'last_error' => null]);
+            }
+
+            $this->refreshBatch($batch);
+
+            return $batch->fresh('items');
+        });
+    }
+
     public function refreshBatch(DeviceSyncBatch $batch): DeviceSyncBatch
     {
         $counts = $batch->items()
@@ -311,11 +410,15 @@ class DeviceSyncBatchService
 
     private function cleanName(mixed $name): string
     {
-        return mb_substr(
-            preg_replace('/[\x00-\x1F\x7F]/u', '', trim((string) $name)) ?? '',
-            0,
-            24
-        );
+        $clean = preg_replace('/[\x00-\x1F\x7F]/u', '', trim((string) $name)) ?? '';
+
+        // El equipo guarda el nombre en un campo de 23 BYTES, no de 23 caracteres
+        // (verificado contra los OPERLOG reales: los nombres ASCII vuelven
+        // cortados exactamente ahí). Recortar por caracteres deja que sea el
+        // equipo quien parta el nombre, y si el corte cae a mitad de una letra
+        // acentuada devuelve UTF-8 inválido que rompe el cast de device_users.
+        // mb_strcut recorta por bytes sin partir caracteres multibyte.
+        return mb_strcut($clean, 0, 23);
     }
 
     private function cleanSystemName(mixed $name): string
@@ -330,5 +433,10 @@ class DeviceSyncBatchService
     private function userPayload(string $pin, string $name): string
     {
         return "DATA UPDATE USERINFO PIN={$pin}\tName={$name}\tPassword=\tPrivilege=0\tGroup=1";
+    }
+
+    private function deletePayload(string $pin): string
+    {
+        return "DATA DELETE USERINFO PIN={$pin}";
     }
 }
