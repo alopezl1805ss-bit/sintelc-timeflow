@@ -23,3 +23,9 @@
 Homestead.json
 Homestead.yaml
 Thumbs.db
+
+# Respaldos de .env — nunca deben llegar al repositorio: contienen las
+# credenciales de OAuth de Factorial, la contraseña de BD y la APP_KEY.
+.env.bak*
+.env.*.bak
+*.bak
