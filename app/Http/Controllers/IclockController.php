@@ -113,16 +113,26 @@ class IclockController extends Controller
             return $this->handleRtlog($request, $sn);
         }
 
-        if ($table === 'USERINFO' || $table === 'user') {
-            return $this->handleUserInfo($request, $sn, $table);
-        }
+        // Los canales de inventario (usuarios, biodata) son informativos. Si uno
+        // falla y devolvemos 500, el equipo se queda reintentando ese mismo
+        // paquete indefinidamente y nunca llega a subir los ATTLOG. Se registra
+        // el error y se responde OK para no bloquear la asistencia.
+        if (in_array($table, ['USERINFO', 'user', 'OPERLOG', 'BIODATA'], true)) {
+            try {
+                return match ($table) {
+                    'OPERLOG' => $this->handleOperlog($request, $sn),
+                    'BIODATA' => $this->handleBiodata($request, $sn),
+                    default   => $this->handleUserInfo($request, $sn, $table),
+                };
+            } catch (\Throwable $e) {
+                Log::error('ZKTeco inventario: fallo al procesar tabla, se responde OK para no bloquear ATTLOG', [
+                    'sn'    => $sn,
+                    'table' => $table,
+                    'error' => $e->getMessage(),
+                ]);
 
-        if ($table === 'OPERLOG') {
-            return $this->handleOperlog($request, $sn);
-        }
-
-        if ($table === 'BIODATA') {
-            return $this->handleBiodata($request, $sn);
+                return $this->plainResponse('OK');
+            }
         }
 
         return $this->plainResponse('OK');
@@ -204,6 +214,26 @@ class IclockController extends Controller
 
     // ─── Private: Handlers ───────────────────────────────────────────
 
+    /**
+     * Los equipos truncan el campo Name a un número fijo de bytes, lo que puede
+     * partir por la mitad un carácter UTF-8 multibyte (p. ej. la Ñ de "MUÑOZ").
+     * El byte suelto hace fallar el cast JSON de device_users. Se descartan los
+     * bytes inválidos en vez de propagarlos.
+     */
+    private function cleanDeviceString(string $value): string
+    {
+        if ($value === '' || mb_check_encoding($value, 'UTF-8')) {
+            return $value;
+        }
+
+        $previous = mb_substitute_character();
+        mb_substitute_character('none');
+        $clean = mb_convert_encoding($value, 'UTF-8', 'UTF-8');
+        mb_substitute_character($previous);
+
+        return trim($clean);
+    }
+
     private function handleUserInfo(Request $request, ?string $sn, string $table = 'USERINFO'): Response
     {
         $source = BiometricSource::where('serial_number', $sn)->first();
@@ -231,9 +261,9 @@ class IclockController extends Controller
 
             $users[] = [
                 'pin'       => $pin,
-                'name'      => $fields['Name'] ?? '',
+                'name'      => $this->cleanDeviceString($fields['Name'] ?? ''),
                 // Attendance PUSH: Card= / Security PUSH: CardNo=
-                'card'      => $fields['Card'] ?? $fields['CardNo'] ?? '',
+                'card'      => $this->cleanDeviceString($fields['Card'] ?? $fields['CardNo'] ?? ''),
                 // Attendance PUSH: Role= / Security PUSH: Privilege=
                 'privilege' => $fields['Role'] ?? $fields['Privilege'] ?? '0',
                 'protocol'  => $table === 'user' ? 'security' : 'attendance',
@@ -285,8 +315,8 @@ class IclockController extends Controller
 
             $users[] = [
                 'pin'       => $pin,
-                'name'      => $fields['Name'] ?? '',
-                'card'      => $fields['Card'] ?? $fields['CardNo'] ?? '',
+                'name'      => $this->cleanDeviceString($fields['Name'] ?? ''),
+                'card'      => $this->cleanDeviceString($fields['Card'] ?? $fields['CardNo'] ?? ''),
                 'privilege' => $fields['Pri'] ?? $fields['Privilege'] ?? '0',
                 'protocol'  => 'operlog',
             ];
@@ -398,28 +428,37 @@ class IclockController extends Controller
                 'occurred_at'           => $occurredAt,
                 'raw_payload'           => json_encode(compact('pin', 'timestamp', 'status', 'verify', 'workcode')),
                 'sync_status'           => $syncStatus,
+                'sync_note'             => null,
                 'created_at'            => $now,
                 'updated_at'            => $now,
             ];
         }
 
+        $records = $this->applyDedupeWindow($records, $source);
+
         if (!empty($records)) {
             AttendanceLog::insertOrIgnore($records);
 
             // ── Despachar jobs para records resueltos ────────────────────
-            $resolvedCodes = array_column(
-                array_filter($records, fn($r) => $r['sync_status'] === 'resolved'),
-                'employee_code'
-            );
+            $resolved = array_filter($records, fn($r) => $r['sync_status'] === 'resolved');
 
-            if (!empty($resolvedCodes)) {
-                // Recuperar los IDs recién insertados, ordenados cronológicamente.
+            if (!empty($resolved)) {
+                // Identificamos los recién insertados por su clave exacta
+                // (employee_code + occurred_at) en vez de por ventana de tiempo:
+                // filtrar por created_at >= now()-2min reagarraba registros de
+                // lotes anteriores y volvía a despachar jobs ya despachados
+                // (632 ejecuciones para 411 logs distintos el 2026-09-02).
+                $insertedKeys = array_map(
+                    fn($r) => $r['employee_code'] . '|' . $r['occurred_at']->format('Y-m-d H:i:s'),
+                    $resolved
+                );
+
                 // Al ordenar por occurred_at ASC garantizamos que los registros
                 // acumulados offline se envían a Factorial de más antiguo a más
                 // reciente: check_out de ayer antes que check_in de hoy.
                 $insertedIds = AttendanceLog::where('biometric_source_id', $source->id)
-                    ->whereIn('employee_code', $resolvedCodes)
-                    ->where('created_at', '>=', now()->subMinutes(2))
+                    ->where('sync_status', 'resolved')
+                    ->whereIn(DB::raw("CONCAT(employee_code, '|', occurred_at)"), $insertedKeys)
                     ->orderBy('occurred_at')
                     ->pluck('id');
 
@@ -434,6 +473,94 @@ class IclockController extends Controller
         Log::info('ZKTeco ATTLOG procesado', ['sn' => $sn, 'count' => count($records)]);
 
         return $this->plainResponse('OK: ' . count($records));
+    }
+
+    /**
+     * Ventana anti-rebote. Los equipos multimodales (huella + cara) reportan la
+     * MISMA llegada varias veces con segundos de diferencia. Sin este filtro
+     * cada repetición viajaba a Factorial como un check_in nuevo, chocaba con
+     * "open_shift" (409) y el fallback de updateShift() acababa sobrescribiendo
+     * el clock_in real con la lectura más tardía, corriendo la hora de entrada
+     * hacia adelante (OUTLANDISH, 2026-09-01: 13:52:58 pisado a 13:53:03, y el
+     * cierre automático heredando el error como 21:53:03).
+     *
+     * Gana siempre la PRIMERA lectura. Las repeticiones se guardan con
+     * sync_status 'descartado': siguen visibles en la pantalla de registros del
+     * cliente — con su nota explicando a qué lectura ceden — pero nunca se
+     * despachan a Factorial.
+     *
+     * El alcance es el CLIENTE, no el dispositivo: dos equipos del mismo
+     * cliente leyendo a la misma persona con segundos de diferencia son igual
+     * de duplicados que un equipo leyéndola dos veces.
+     *
+     * @param  array<int, array<string, mixed>>  $records
+     * @return array<int, array<string, mixed>>
+     */
+    private function applyDedupeWindow(array $records, BiometricSource $source): array
+    {
+        $window = (int) (
+            config("attendance.dedupe_window_overrides.{$source->client_id}")
+            ?? config('attendance.dedupe_window_seconds', 120)
+        );
+
+        if ($window <= 0 || empty($records)) {
+            return $records;
+        }
+
+        // Orden cronológico para que "la primera gana" aplique también dentro
+        // del mismo lote — el equipo no garantiza el orden dentro del payload.
+        usort($records, fn($a, $b) => $a['occurred_at'] <=> $b['occurred_at']);
+
+        $earliest = $records[0]['occurred_at']->copy()->subSeconds($window);
+
+        // Última ponchada NO descartada por (pin, check_type) que ya está en BD,
+        // para que un lote nuevo no reviva una repetición del lote anterior.
+        $previous = [];
+        AttendanceLog::where('client_id', $source->client_id)
+            ->whereIn('employee_code', array_unique(array_column($records, 'employee_code')))
+            ->where('occurred_at', '>=', $earliest)
+            ->where('sync_status', '!=', 'descartado')
+            ->orderBy('occurred_at')
+            ->get(['employee_code', 'check_type', 'occurred_at'])
+            ->each(function ($log) use (&$previous) {
+                $previous[$log->employee_code . '|' . $log->check_type] = $log->occurred_at;
+            });
+
+        $discarded = 0;
+
+        foreach ($records as $i => $record) {
+            // 'unknown' nunca se despacha de todos modos; se deja intacto para
+            // no alterar el backlog de los equipos que mandan status=255.
+            if ($record['check_type'] === 'unknown') {
+                continue;
+            }
+
+            $key  = $record['employee_code'] . '|' . $record['check_type'];
+            $last = $previous[$key] ?? null;
+
+            if ($last && abs((int) $record['occurred_at']->diffInSeconds($last)) <= $window) {
+                $records[$i]['sync_status'] = 'descartado';
+                $records[$i]['sync_note']   = 'Repetición del equipo — vale la lectura de las '
+                    . $last->format('H:i:s');
+                $discarded++;
+                continue;
+            }
+
+            // Sólo la lectura que se conserva mueve la ventana hacia adelante:
+            // así una ráfaga larga no se encadena indefinidamente.
+            $previous[$key] = $record['occurred_at'];
+        }
+
+        if ($discarded > 0) {
+            Log::info('ZKTeco ATTLOG: repeticiones descartadas por ventana anti-rebote', [
+                'sn'        => $source->serial_number,
+                'client_id' => $source->client_id,
+                'window_s'  => $window,
+                'discarded' => $discarded,
+            ]);
+        }
+
+        return $records;
     }
 
     private function handleBiodata(Request $request, ?string $sn): Response
