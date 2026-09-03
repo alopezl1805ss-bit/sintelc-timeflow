@@ -39,7 +39,7 @@ new class extends Component {
 
         // Dispositivos por empresa — cambia poco, cache de 5 min
         $this->byClient = Cache::remember('stats.by_client', 300, function () {
-            $counts  = BiometricSource::selectRaw('client_id, count(*) as total')->whereNotNull('client_id')->groupBy('client_id')->pluck('total', 'client_id');
+            $counts  = BiometricSource::selectRaw('client_id, count(*) as total')->whereNotNull('client_id')->where('status', '!=', 'virtual')->groupBy('client_id')->pluck('total', 'client_id');
             $clients = Client::whereIn('id', $counts->keys())->pluck('name', 'id');
             return $counts->map(fn($total, $clientId) => [
                 'name'  => $clients[$clientId] ?? 'Sin cliente',

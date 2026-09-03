@@ -238,7 +238,7 @@ new class extends Component {
             $this->deviceLocationMap       = [];
         } else {
             $this->expandedLocationsClient = $clientId;
-            $sources = BiometricSource::where('client_id', $clientId)->get();
+            $sources = BiometricSource::where('client_id', $clientId)->where('status', '!=', 'virtual')->get();
             $this->deviceLocationMap = $sources->pluck('factorial_location_id', 'id')
                 ->map(fn($v) => (string) ($v ?? ''))
                 ->toArray();

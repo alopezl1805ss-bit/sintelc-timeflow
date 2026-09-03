@@ -7,6 +7,7 @@ new class extends Component {
     public function with(): array
     {
         $devices = BiometricSource::with(['client', 'location'])
+            ->where('status', '!=', 'virtual')
             ->latest()
             ->limit(5)
             ->get();

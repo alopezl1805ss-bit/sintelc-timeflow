@@ -73,6 +73,10 @@ new class extends Component {
 
         $devices = BiometricSource::with(['client', 'location'])
             ->whereNotNull('client_id')
+            // Excluye las fuentes virtuales (status='virtual') creadas por
+            // CloseForgottenShiftJob para poder registrar cierres automáticos
+            // en attendance_logs — no son dispositivos reales que gestionar aquí.
+            ->where('status', '!=', 'virtual')
             ->when(!$isAdmin, fn($q) => $q->where('client_id', $user->client_id))
             ->withCount('attendanceLogs')
             ->when($this->statusFilter === 'online',   fn($q) => $q->where('status', 'active')->where('last_ping_at', '>=', now()->subMinutes(15)))
@@ -191,6 +195,17 @@ new class extends Component {
 
         $data = $this->validate();
 
+        // Autoprovisión del proveedor biométrico: para una empresa nueva
+        // todavía no existe ninguno, así que el selector solo ofrecía
+        // "Sin asignar" y el equipo quedaba sin biometric_provider_id. El
+        // dispositivo se creaba bien, pero al importarle empleados
+        // DeviceSyncBatchService::create() abortaba con 422. Se crea igual
+        // que en saveAssign() para el equipo descubierto.
+        if ($data['client_id'] && !$data['biometric_provider_id']) {
+            $data['biometric_provider_id'] = $this->resolveProviderFor((int) $data['client_id'])->id;
+            $this->biometric_provider_id   = $data['biometric_provider_id'];
+        }
+
         if ($this->editing) {
             $this->authorizedDevice($this->editingId)->update($data);
         } else {
@@ -204,6 +219,24 @@ new class extends Component {
 
         $this->showModal = false;
         $this->resetForm();
+    }
+
+    /**
+     * Devuelve el proveedor biométrico del cliente, creándolo si la empresa
+     * es nueva. Un cliente solo tiene un proveedor (ZKTeco hoy); el campo
+     * existe para poder colgar de él dispositivos de otros fabricantes más
+     * adelante, no para que el usuario tenga que darlo de alta a mano.
+     */
+    private function resolveProviderFor(int $clientId): BiometricProvider
+    {
+        return BiometricProvider::firstOrCreate(
+            ['client_id' => $clientId],
+            [
+                'factorial_connection_id' => FactorialConnection::where('client_id', $clientId)->value('id'),
+                'vendor'                  => 'zkteco',
+                'status'                  => 'active',
+            ]
+        );
     }
 
     public function delete(int $id): void
@@ -277,8 +310,14 @@ new class extends Component {
         $this->pushSuccessMsg = null;
         $this->importMode     = 'factorial';
 
-        // Empleados ya mapeados en este proveedor
+        // Empleados ya mapeados en este proveedor. El whereNotNull es
+        // obligatorio: las identidades locales (empleados creados a mano, sin
+        // vínculo con Factorial) tienen factorial_employee_id NULL y un solo
+        // NULL dentro del whereNotIn() de abajo hace que MySQL evalúe
+        // "id NOT IN (…, NULL)" como NULL para TODAS las filas y no devuelva
+        // ningún empleado.
         $mappedFactorialIds = BiometricUserSync::where('biometric_provider_id', $source->biometric_provider_id)
+            ->whereNotNull('factorial_employee_id')
             ->pluck('factorial_employee_id')
             ->toArray();
 
@@ -320,7 +359,9 @@ new class extends Component {
 
     private function _pushFromFactorial(BiometricSource $source, bool $isAttendance): void
     {
+        // whereNotNull imprescindible — ver comentario en openImportModal().
         $mappedFactorialIds = BiometricUserSync::where('biometric_provider_id', $source->biometric_provider_id)
+            ->whereNotNull('factorial_employee_id')
             ->pluck('factorial_employee_id')
             ->toArray();
 
@@ -779,7 +820,13 @@ new class extends Component {
                 <div>
                     <label class="block text-sm font-medium text-gray-700">Proveedor biométrico</label>
                     <select wire:model="biometric_provider_id" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm text-sm focus:border-indigo-500 focus:ring-indigo-500">
-                        <option value="">Sin asignar</option>
+                        <option value="">
+                            @if($client_id && $providers->isEmpty())
+                                ZKTeco (se creará automáticamente)
+                            @else
+                                Sin asignar
+                            @endif
+                        </option>
                         @foreach($providers as $provider)
                             @php $vendorLabels = ['zkteco'=>'ZKTeco','hikvision'=>'Hikvision','suprema'=>'Suprema','other'=>'Otro']; @endphp
                             <option value="{{ $provider->id }}">{{ $vendorLabels[$provider->vendor] ?? ucfirst($provider->vendor) }}</option>
