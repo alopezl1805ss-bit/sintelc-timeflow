@@ -287,9 +287,20 @@ class DeviceSyncBatchTest extends TestCase
         $assignment = $identity->deviceAssignments()->firstOrFail();
         $command = DeviceCommand::where('command_type', 'set_user')->firstOrFail();
 
+        // 23 BYTES con mb_strcut, no 24 caracteres con mb_substr.
+        //
+        // El campo del equipo mide 23 bytes, y recortar por caracteres deja que
+        // sea el equipo quien parta el nombre — si el corte cae a mitad de una
+        // letra acentuada devuelve UTF-8 inválido. Eso es exactamente lo que
+        // tumbó /iclock/cdata el 2026-08-31 con un nombre con Ñ: el equipo
+        // seguía viéndose «En línea» y había dejado de subir asistencia.
+        //
+        // El código se corrigió el 2026-09-02 (db587da) y esta aserción se
+        // quedó atrás. Nadie lo vio porque la suite llevaba dos días sin
+        // arrancar, que es el otro arreglo de esta misma rama.
         $this->assertSame($fullName, $identity->local_name);
-        $this->assertSame(mb_substr($fullName, 0, 24), $assignment->name);
-        $this->assertStringContainsString('Name=' . mb_substr($fullName, 0, 24), $command->payload);
+        $this->assertSame(mb_strcut($fullName, 0, 23), $assignment->name);
+        $this->assertStringContainsString('Name=' . mb_strcut($fullName, 0, 23), $command->payload);
         $this->assertStringNotContainsString($fullName, $command->payload);
     }
 
