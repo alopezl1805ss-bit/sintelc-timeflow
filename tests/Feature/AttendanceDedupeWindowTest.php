@@ -40,8 +40,15 @@ class AttendanceDedupeWindowTest extends TestCase
         ]);
     }
 
-    /** @return array<int, array<string, mixed>> */
-    private function run(array $records): array
+    /**
+     * @return array<int, array<string, mixed>>
+     *
+     * Este helper NO puede llamarse `run()`: PHPUnit declara `TestCase::run()`
+     * como `final`, y sobreescribirlo es un error FATAL en tiempo de carga —
+     * que no tumba esta prueba, tumba la SUITE ENTERA. Ni `--list-tests`
+     * funciona. Comprobado con PHPUnit 11.5.56, la versión que fija composer.lock.
+     */
+    private function aplicar(array $records): array
     {
         $method = new ReflectionMethod(IclockController::class, 'applyDedupeWindow');
         $method->setAccessible(true);
@@ -74,7 +81,7 @@ class AttendanceDedupeWindowTest extends TestCase
 
     public function test_gana_la_primera_lectura_de_una_rafaga(): void
     {
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:52:58'),
             $this->record('2026-09-01 13:53:03'),
             $this->record('2026-09-01 13:53:08'),
@@ -89,7 +96,7 @@ class AttendanceDedupeWindowTest extends TestCase
     {
         // El equipo no garantiza el orden dentro del payload: la lectura más
         // temprana debe ganar aunque venga al final.
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:53:08'),
             $this->record('2026-09-01 13:52:58'),
             $this->record('2026-09-01 13:53:03'),
@@ -101,7 +108,7 @@ class AttendanceDedupeWindowTest extends TestCase
 
     public function test_respeta_ponchadas_legitimas_separadas(): void
     {
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:00:00'),
             $this->record('2026-09-01 13:05:00'),
         ]);
@@ -111,7 +118,7 @@ class AttendanceDedupeWindowTest extends TestCase
 
     public function test_no_mezcla_check_types_distintos(): void
     {
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:00:00', 'check_in'),
             $this->record('2026-09-01 13:00:03', 'check_out'),
         ]);
@@ -121,7 +128,7 @@ class AttendanceDedupeWindowTest extends TestCase
 
     public function test_no_mezcla_empleados_distintos(): void
     {
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:00:00', 'check_in', 'PIN-1'),
             $this->record('2026-09-01 13:00:03', 'check_in', 'PIN-2'),
         ]);
@@ -132,7 +139,7 @@ class AttendanceDedupeWindowTest extends TestCase
     public function test_deja_intactos_los_unknown(): void
     {
         // status=255 nunca se despacha; no queremos alterar ese backlog.
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:00:00', 'unknown'),
             $this->record('2026-09-01 13:00:05', 'unknown'),
         ]);
@@ -151,7 +158,7 @@ class AttendanceDedupeWindowTest extends TestCase
             'sync_status' => 'synced',
         ]);
 
-        $out = $this->run([$this->record('2026-09-01 13:53:03')]);
+        $out = $this->aplicar([$this->record('2026-09-01 13:53:03')]);
 
         $this->assertSame(['descartado'], $this->statuses($out));
     }
@@ -169,7 +176,7 @@ class AttendanceDedupeWindowTest extends TestCase
             'sync_status' => 'descartado',
         ]);
 
-        $out = $this->run([$this->record('2026-09-01 13:54:00')]);
+        $out = $this->aplicar([$this->record('2026-09-01 13:54:00')]);
 
         $this->assertSame(['resolved'], $this->statuses($out));
     }
@@ -178,7 +185,7 @@ class AttendanceDedupeWindowTest extends TestCase
     {
         config(['attendance.dedupe_window_seconds' => 0]);
 
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:52:58'),
             $this->record('2026-09-01 13:53:03'),
         ]);
@@ -190,7 +197,7 @@ class AttendanceDedupeWindowTest extends TestCase
     {
         config(['attendance.dedupe_window_overrides' => [$this->source->client_id => 3]]);
 
-        $out = $this->run([
+        $out = $this->aplicar([
             $this->record('2026-09-01 13:00:00'),
             $this->record('2026-09-01 13:00:10'),
         ]);

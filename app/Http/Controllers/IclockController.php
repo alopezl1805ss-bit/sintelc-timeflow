@@ -435,6 +435,7 @@ class IclockController extends Controller
         }
 
         $records = $this->applyDedupeWindow($records, $source);
+        $records = $this->applyOncePerDay($records, $source);
 
         if (!empty($records)) {
             AttendanceLog::insertOrIgnore($records);
@@ -557,6 +558,131 @@ class IclockController extends Controller
                 'client_id' => $source->client_id,
                 'window_s'  => $window,
                 'discarded' => $discarded,
+            ]);
+        }
+
+        return $records;
+    }
+
+    /**
+     * Una lectura por persona, tipo y DÍA. Complementa la ventana anti-rebote.
+     *
+     * ── El hueco que cubre ──────────────────────────────────────────────────
+     *
+     * `applyDedupeWindow` resuelve las repeticiones separadas por SEGUNDOS: el
+     * equipo multimodal leyendo la misma llegada dos veces. Funciona, y desde
+     * que está activa OUTLANDISH pasó de 212 fallos en un día a 2.
+     *
+     * Pero queda otra forma del mismo problema, separada por HORAS. La gente
+     * pasa por el lector varias veces al día —mediana de 4 en OUTLANDISH, hasta
+     * 5 en ACERMEX— y el equipo etiqueta entrada/salida de forma inconsistente.
+     * Cada repetición viaja a Factorial como una orden nueva y choca:
+     *
+     *     05:17  check_out  → «No existe ningún turno abierto»
+     *     05:17  check_in   → aceptado
+     *     10:53  check_in   → aceptado
+     *     11:29  check_in   → «Turno ya editado por biométrico SFT»
+     *     14:17  check_in   → «Turno ya editado por biométrico SFT»
+     *
+     * Medido sobre los datos reales: suprimir esas repeticiones habría evitado
+     * el 75 % de los fallos de los últimos días y el 71 % desde agosto.
+     *
+     * ── Lo que cuesta, dicho claramente ─────────────────────────────────────
+     *
+     * Si un cliente tiene un flujo legítimo de salir a comer y volver, la
+     * segunda entrada del día es REAL y esto la suprimiría. Por eso es
+     * **opt-in por cliente** y no un cambio global.
+     *
+     * El matiz que lo hace aceptable donde sí se active: hoy esas repeticiones
+     * FALLAN de todos modos. No llegan a Factorial — se rechazan y, peor, el
+     * fallback de `updateShift()` puede acabar pisando el `clock_in` real con
+     * la lectura más tardía. Suprimirlas no pierde un dato que hoy funcione:
+     * evita que uno que ya está roto siga corrompiendo el que sí funcionaba.
+     *
+     * ── Y es una mitigación, no la solución ─────────────────────────────────
+     *
+     * La solución de fondo es derivar la jornada completa de la persona a
+     * partir de todos sus marcajes del día —alternancia incluida— y hacer
+     * converger Factorial hacia ella, en vez de emitir una orden por marcaje.
+     * Eso es un cambio de modelo, no un parche. Esto compra tiempo.
+     *
+     * El día laboral es el día natural en la zona del servidor
+     * (America/Mexico_City). No se introduce aquí una hora de corte
+     * configurable: sería un concepto nuevo, y este cambio quiere ser pequeño.
+     * Los turnos nocturnos de un cliente que cruce medianoche NO deben activar
+     * esta regla.
+     *
+     * @param  array<int, array<string, mixed>>  $records
+     * @return array<int, array<string, mixed>>
+     */
+    private function applyOncePerDay(array $records, BiometricSource $source): array
+    {
+        $clientes = (array) config('attendance.once_per_day_clients', []);
+
+        if (empty($records) || ! in_array($source->client_id, $clientes, true)) {
+            return $records;
+        }
+
+        // Cronológico: «la primera gana» tiene que aplicar también dentro del
+        // lote, y el equipo no garantiza el orden dentro del payload.
+        usort($records, fn ($a, $b) => $a['occurred_at'] <=> $b['occurred_at']);
+
+        // Días naturales tocados por este lote, para acotar la consulta.
+        $dias = array_unique(array_map(
+            fn ($r) => $r['occurred_at']->copy()->startOfDay()->toDateTimeString(),
+            $records,
+        ));
+
+        // Lo que ya está en base para esas personas y esos días, sin contar lo
+        // descartado: así un lote nuevo no revive una repetición del anterior.
+        $vistos = [];
+        AttendanceLog::where('client_id', $source->client_id)
+            ->whereIn('employee_code', array_unique(array_column($records, 'employee_code')))
+            ->where('occurred_at', '>=', min($dias))
+            ->where('occurred_at', '<', date('Y-m-d H:i:s', strtotime(max($dias) . ' +1 day')))
+            ->where('sync_status', '!=', 'descartado')
+            ->orderBy('occurred_at')
+            ->get(['employee_code', 'check_type', 'occurred_at'])
+            ->each(function ($log) use (&$vistos) {
+                $clave = $log->employee_code . '|' . $log->check_type . '|' . $log->occurred_at->toDateString();
+                $vistos[$clave] ??= $log->occurred_at;
+            });
+
+        $descartados = 0;
+
+        foreach ($records as $i => $record) {
+            // 'unknown' nunca se despacha; se deja intacto para no alterar el
+            // backlog de los equipos que mandan status=255. Igual que en la
+            // ventana anti-rebote.
+            if ($record['check_type'] === 'unknown') {
+                continue;
+            }
+
+            // Y lo que la ventana anti-rebote ya descartó no se vuelve a tocar.
+            if (($record['sync_status'] ?? null) === 'descartado') {
+                continue;
+            }
+
+            $clave = $record['employee_code'] . '|' . $record['check_type']
+                . '|' . $record['occurred_at']->toDateString();
+
+            if (isset($vistos[$clave])) {
+                $records[$i]['sync_status'] = 'descartado';
+                $records[$i]['sync_note'] = 'Repetición del día — vale la lectura de las '
+                    . $vistos[$clave]->format('H:i:s');
+                $descartados++;
+
+                continue;
+            }
+
+            $vistos[$clave] = $record['occurred_at'];
+        }
+
+        if ($descartados > 0) {
+            Log::info('ZKTeco ATTLOG: repeticiones descartadas por regla de una por día', [
+                'sn'          => $source->serial_number,
+                'client_id'   => $source->client_id,
+                'descartados' => $descartados,
             ]);
         }
 

@@ -41,4 +41,29 @@ return [
 
     'dedupe_window_overrides' => [],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Una lectura por persona, tipo y día
+    |--------------------------------------------------------------------------
+    |
+    | [client_id, ...]. OPT-IN, deliberadamente vacío.
+    |
+    | Complementa la ventana anti-rebote, que solo cubre repeticiones separadas
+    | por segundos. Aquí se cubren las separadas por HORAS: la persona pasa
+    | varias veces al día por el lector y cada pasada viaja a Factorial como una
+    | orden nueva, chocando con «Ya existe un turno» o «Turno ya editado».
+    |
+    | Medido sobre los datos reales del 2026-09-04: activarlo habría evitado el
+    | 75 % de los fallos de los últimos días.
+    |
+    | NO lo actives para un cliente que tenga un flujo legítimo de salir y
+    | volver el mismo día: la segunda entrada sería real y se perdería. Candidatos
+    | claros según los datos: ACERMEX (36 de los 51 fallos recientes) y
+    | OUTLANDISH (checkin_only: por definición nunca hay una segunda entrada
+    | legítima).
+    |
+    */
+
+    'once_per_day_clients' => [],
+
 ];
