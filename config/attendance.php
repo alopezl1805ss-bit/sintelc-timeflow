@@ -43,27 +43,56 @@ return [
 
     /*
     |--------------------------------------------------------------------------
-    | Una lectura por persona, tipo y día
+    | Una lectura por persona, tipo y día — salvo que haya una salida en medio
     |--------------------------------------------------------------------------
     |
-    | [client_id, ...]. OPT-IN, deliberadamente vacío.
+    | [client_id, ...]. OPT-IN por cliente.
     |
     | Complementa la ventana anti-rebote, que solo cubre repeticiones separadas
-    | por segundos. Aquí se cubren las separadas por HORAS: la persona pasa
+    | por SEGUNDOS. Aquí se cubren las separadas por HORAS: la persona pasa
     | varias veces al día por el lector y cada pasada viaja a Factorial como una
-    | orden nueva, chocando con «Ya existe un turno» o «Turno ya editado».
+    | orden nueva. O choca —«Ya existe un turno»— o, peor, entra por el fallback
+    | de updateShift() y PISA el clock_in real con la lectura más tardía.
     |
-    | Medido sobre los datos reales del 2026-09-04: activarlo habría evitado el
-    | 75 % de los fallos de los últimos días.
+    | La regla NO es «una entrada por día». Una lectura repetida se descarta
+    | solo si no hay una lectura del tipo OPUESTO entre ella y la anterior del
+    | mismo tipo: quien sale a comer y vuelve conserva su segunda entrada.
     |
-    | NO lo actives para un cliente que tenga un flujo legítimo de salir y
-    | volver el mismo día: la segunda entrada sería real y se perdería. Candidatos
-    | claros según los datos: ACERMEX (36 de los 51 fallos recientes) y
-    | OUTLANDISH (checkin_only: por definición nunca hay una segunda entrada
-    | legítima).
+    | ── Por qué está activada en estos dos y no en el resto ──
+    |
+    | Medido sobre 14 días de datos reales el 2026-09-04, antes de activar:
+    |
+    |   OUTLANDISH (#4)   691 jornadas · 271 con entrada repetida ·  0 con salida
+    |                     en medio. Es checkin_only: el equipo nunca manda
+    |                     salidas, así que no existe una segunda entrada
+    |                     legítima. De las repeticiones, 339 fallaban a la vista
+    |                     y 294 figuraban como «synced» habiendo sobrescrito el
+    |                     turno — el daño que no se veía. Caso PIN 2003002,
+    |                     2026-08-27: entró 04:26, la pasada de 11:20 movió su
+    |                     clock_in, y el cierre automático heredó la hora mala.
+    |                     Su jornada quedó registrada como 11:20→22:20.
+    |
+    |   ACERMEX (#21)     180 jornadas · 131 con entrada repetida · 58 CON salida
+    |                     en medio. Esas 58 son regresos reales, y por eso este
+    |                     cliente necesitaba primero el guardarraíl. Con él se
+    |                     conservan, y se descartan las 73 que sí son
+    |                     repeticiones.
+    |
+    | ── Antes de añadir un tercero ──
+    |
+    | Hay que repetir la medición, no suponerla. Lo que la hace segura es
+    | comparar, por cliente, cuántas jornadas con lectura repetida tienen una
+    | lectura opuesta en medio. Si esa proporción es alta y el equipo registra
+    | mal las salidas, activarlo pierde datos reales.
+    |
+    | Un cliente con turnos que cruzan medianoche NO debe activarla: el día
+    | laboral aquí es el día natural de America/Mexico_City, sin hora de corte.
     |
     */
 
-    'once_per_day_clients' => [],
+    'once_per_day_clients' => [
+        4,   // OUTLANDISH SA DE CV
+        21,  // ACERMEX
+    ],
 
 ];

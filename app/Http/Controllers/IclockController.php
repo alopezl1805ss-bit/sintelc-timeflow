@@ -587,17 +587,46 @@ class IclockController extends Controller
      * Medido sobre los datos reales: suprimir esas repeticiones habría evitado
      * el 75 % de los fallos de los últimos días y el 71 % desde agosto.
      *
-     * ── Lo que cuesta, dicho claramente ─────────────────────────────────────
+     * ── El guardarraíl: una salida en medio hace que la entrada sea real ───
      *
-     * Si un cliente tiene un flujo legítimo de salir a comer y volver, la
-     * segunda entrada del día es REAL y esto la suprimiría. Por eso es
-     * **opt-in por cliente** y no un cambio global.
+     * La primera versión suprimía TODA entrada repetida del día. Medido contra
+     * los datos reales ANTES de activarla, eso habría sido correcto en
+     * OUTLANDISH y destructivo en ACERMEX (14 días, 2026-09-04):
      *
-     * El matiz que lo hace aceptable donde sí se active: hoy esas repeticiones
-     * FALLAN de todos modos. No llegan a Factorial — se rechazan y, peor, el
-     * fallback de `updateShift()` puede acabar pisando el `clock_in` real con
-     * la lectura más tardía. Suprimirlas no pierde un dato que hoy funcione:
-     * evita que uno que ya está roto siga corrompiendo el que sí funcionaba.
+     *     OUTLANDISH   271 jornadas con entrada repetida ·  0 con salida en medio
+     *     ACERMEX      131 jornadas con entrada repetida · 58 con salida en medio
+     *
+     * Esas 58 son gente que salió a comer y volvió: la segunda entrada es REAL.
+     * Caso textual, PIN 3437436, 2026-08-28:
+     *
+     *     14:07  check_in    ← llegada
+     *     15:51  check_out   ← sale
+     *     18:05  check_in    ← vuelve. Real. Descartarla sería perder horas.
+     *
+     * Así que la regla NO es «una entrada por día». Es: se descarta una lectura
+     * repetida solo si no hay una lectura del tipo OPUESTO entre ella y la
+     * anterior del mismo tipo. Una salida en medio reinicia el ancla.
+     *
+     * En OUTLANDISH esto no relaja nada —es `checkin_only`, el equipo nunca
+     * manda salidas— y de paso añade un acierto: el cierre automático escribe
+     * una salida sintética, así que una entrada POSTERIOR a ese cierre se
+     * reconoce como turno nuevo en vez de perderse.
+     *
+     * ── Lo que sigue costando ──────────────────────────────────────────────
+     *
+     * Si alguien sale y vuelve pero el equipo no registró la salida, su regreso
+     * se descarta. Es el caso que queda, y es pequeño frente a lo que evita.
+     *
+     * Caso documentado, OUTLANDISH, PIN 2003002, 2026-08-27:
+     *
+     *     04:26  check_in   synced  «directo»          ← llegada real
+     *     11:20  check_in   synced  «overwrite (api)»  ← pisa el clock_in
+     *     22:20  check_out  synced  cierre automático  ← hereda la hora mala
+     *
+     * Su turno quedó como 11:20→22:20 en vez de arrancar a las 04:26. En 14
+     * días eso le pasó a 294 lecturas que figuran como «synced»: no fallan,
+     * corrompen en silencio. Suprimir la de las 11:20 no pierde un dato bueno
+     * — impide que uno roto siga estropeando el que sí funcionaba.
      *
      * ── Y es una mitigación, no la solución ─────────────────────────────────
      *
@@ -633,9 +662,14 @@ class IclockController extends Controller
             $records,
         ));
 
-        // Lo que ya está en base para esas personas y esos días, sin contar lo
-        // descartado: así un lote nuevo no revive una repetición del anterior.
-        $vistos = [];
+        // La línea de tiempo completa de cada persona y día: lo ya guardado más
+        // lo que se vaya aceptando de este lote.
+        //
+        // Hace falta ENTERA, no solo la primera lectura de cada tipo, porque la
+        // decisión depende de si hubo una lectura opuesta en medio. Se excluye
+        // lo descartado para que un lote nuevo no reviva una repetición vieja.
+        $linea = [];
+
         AttendanceLog::where('client_id', $source->client_id)
             ->whereIn('employee_code', array_unique(array_column($records, 'employee_code')))
             ->where('occurred_at', '>=', min($dias))
@@ -643,9 +677,9 @@ class IclockController extends Controller
             ->where('sync_status', '!=', 'descartado')
             ->orderBy('occurred_at')
             ->get(['employee_code', 'check_type', 'occurred_at'])
-            ->each(function ($log) use (&$vistos) {
-                $clave = $log->employee_code . '|' . $log->check_type . '|' . $log->occurred_at->toDateString();
-                $vistos[$clave] ??= $log->occurred_at;
+            ->each(function ($log) use (&$linea) {
+                $dia = $log->employee_code . '|' . $log->occurred_at->toDateString();
+                $linea[$dia][] = ['t' => $log->occurred_at, 'tipo' => $log->check_type];
             });
 
         $descartados = 0;
@@ -658,24 +692,32 @@ class IclockController extends Controller
                 continue;
             }
 
-            // Y lo que la ventana anti-rebote ya descartó no se vuelve a tocar.
+            // Y lo que la ventana anti-rebote ya descartó no se vuelve a tocar:
+            // las dos notas dicen cosas distintas y las dos son ciertas.
             if (($record['sync_status'] ?? null) === 'descartado') {
                 continue;
             }
 
-            $clave = $record['employee_code'] . '|' . $record['check_type']
-                . '|' . $record['occurred_at']->toDateString();
+            $dia = $record['employee_code'] . '|' . $record['occurred_at']->toDateString();
+            $ancla = $this->lastOfType($linea[$dia] ?? [], $record['check_type']);
 
-            if (isset($vistos[$clave])) {
+            $esRepeticion = $ancla !== null && ! $this->hasOppositeBetween(
+                $linea[$dia] ?? [],
+                $record['check_type'],
+                $ancla,
+                $record['occurred_at'],
+            );
+
+            if ($esRepeticion) {
                 $records[$i]['sync_status'] = 'descartado';
                 $records[$i]['sync_note'] = 'Repetición del día — vale la lectura de las '
-                    . $vistos[$clave]->format('H:i:s');
+                    . $ancla->format('H:i:s');
                 $descartados++;
 
                 continue;
             }
 
-            $vistos[$clave] = $record['occurred_at'];
+            $linea[$dia][] = ['t' => $record['occurred_at'], 'tipo' => $record['check_type']];
         }
 
         if ($descartados > 0) {
@@ -687,6 +729,68 @@ class IclockController extends Controller
         }
 
         return $records;
+    }
+
+    /**
+     * El tipo opuesto — el que convierte una repetición en un regreso real.
+     *
+     * Solo el opuesto EXACTO cuenta. Un 'unknown' en medio no reinicia nada:
+     * es basura de un equipo con status=255, no la prueba de que la persona
+     * saliera.
+     */
+    private const OPPOSITE_CHECK_TYPE = [
+        'check_in'   => 'check_out',
+        'check_out'  => 'check_in',
+        'break_in'   => 'break_out',
+        'break_out'  => 'break_in',
+    ];
+
+    /**
+     * La última lectura de ese tipo en el día, o null si no hay ninguna.
+     *
+     * La ÚLTIMA y no la primera: tras un regreso legítimo, el ancla pasa a ser
+     * la entrada del regreso. Si no, una tercera pasada se compararía con la
+     * llegada de la mañana y sobreviviría por tener una salida en medio.
+     *
+     * @param  array<int, array{t: \Carbon\Carbon, tipo: string}>  $linea
+     */
+    private function lastOfType(array $linea, string $tipo): ?\Carbon\Carbon
+    {
+        $ultima = null;
+
+        foreach ($linea as $x) {
+            if ($x['tipo'] === $tipo && ($ultima === null || $x['t'] > $ultima)) {
+                $ultima = $x['t'];
+            }
+        }
+
+        return $ultima;
+    }
+
+    /**
+     * ¿Hay una lectura del tipo opuesto estrictamente entre las dos horas?
+     *
+     * Un tipo sin opuesto conocido devuelve `true` —o sea, no se descarta—.
+     * Ante la duda, el registro sobrevive: perder una ponchada real es peor que
+     * dejar pasar una repetición, que a lo sumo vuelve a fallar como hoy.
+     *
+     * @param  array<int, array{t: \Carbon\Carbon, tipo: string}>  $linea
+     */
+    private function hasOppositeBetween(array $linea, string $tipo, \Carbon\Carbon $desde, \Carbon\Carbon $hasta): bool
+    {
+        $opuesto = self::OPPOSITE_CHECK_TYPE[$tipo] ?? null;
+
+        if ($opuesto === null) {
+            return true;
+        }
+
+        foreach ($linea as $x) {
+            if ($x['tipo'] === $opuesto && $x['t'] > $desde && $x['t'] < $hasta) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private function handleBiodata(Request $request, ?string $sn): Response
