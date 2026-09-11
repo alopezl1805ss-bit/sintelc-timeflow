@@ -169,7 +169,7 @@ new class extends Component {
                 $assigned = BiometricSource::where('serial_number', $this->serial_number)->exists();
                 $this->addError('serial_number', $assigned
                     ? 'Este dispositivo ya está registrado en otra empresa.'
-                    : 'El dispositivo aún no se ha conectado al servidor. Verifica la configuración e intenta de nuevo.');
+                    : 'Este equipo todavía no se ha reportado al servidor. Verifica que esté encendido, con red y con el servidor app.sintelcft.dev configurado (Menú → Comunicación → Servidor ADMS), espera un par de minutos e inténtalo de nuevo.');
                 return;
             }
 
@@ -563,7 +563,7 @@ new class extends Component {
                 <svg class="w-4 h-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/>
                 </svg>
-                {{ $isAdmin ? 'Nuevo dispositivo' : 'Agregar dispositivo' }}
+                {{ $isAdmin ? 'Nuevo dispositivo' : 'Reclamar dispositivo' }}
             </button>
         </div>
         <div class="border-t border-gray-100 mt-4 pt-3 flex items-center justify-between">
@@ -764,7 +764,7 @@ new class extends Component {
         <div class="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
             <div class="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
                 <h3 class="text-lg font-medium text-gray-900">
-                    {{ $editing ? 'Editar dispositivo' : ($isAdmin ? 'Nuevo dispositivo' : 'Agregar dispositivo') }}
+                    {{ $editing ? 'Editar dispositivo' : ($isAdmin ? 'Nuevo dispositivo' : 'Reclamar dispositivo') }}
                 </h3>
                 <button wire:click="$set('showModal', false)" class="text-gray-400 hover:text-gray-600">
                     <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -786,7 +786,7 @@ new class extends Component {
                         placeholder="{{ !$isAdmin ? 'Ej: CGXD230900001' : '' }}"/>
                     @error('serial_number') <p class="mt-1 text-xs text-red-600">{{ $message }}</p> @enderror
                     @if(!$isAdmin && !$editing)
-                    <p class="mt-1 text-xs text-gray-400">Ingresa el número de serie tal como aparece en el dispositivo. Solo se puede agregar si ya está conectado al servidor.</p>
+                    <p class="mt-1 text-xs text-gray-400">Escribe el número de serie tal como aparece en la etiqueta del equipo. El equipo debe estar encendido, con red y configurado hacia app.sintelcft.dev antes de reclamarlo: aquí no se crea, se vincula a tu empresa uno que ya se reportó al servidor.</p>
                     @endif
                 </div>
 
@@ -796,7 +796,7 @@ new class extends Component {
                         <label class="block text-sm font-medium text-gray-700">
                             Cliente <span class="text-gray-400 font-normal">(opcional)</span>
                         </label>
-                        <select wire:model="client_id" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm text-sm focus:border-indigo-500 focus:ring-indigo-500">
+                        <select wire:model.live="client_id" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm text-sm focus:border-indigo-500 focus:ring-indigo-500">
                             <option value="">Sin asignar</option>
                             @foreach($clients as $client)
                                 <option value="{{ $client->id }}">{{ $client->name }}</option>
@@ -850,7 +850,7 @@ new class extends Component {
                     Cancelar
                 </button>
                 <button wire:click="save" class="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-md hover:bg-indigo-700">
-                    {{ $editing ? 'Guardar cambios' : ($isAdmin ? 'Crear dispositivo' : 'Agregar dispositivo') }}
+                    {{ $editing ? 'Guardar cambios' : ($isAdmin ? 'Crear dispositivo' : 'Reclamar dispositivo') }}
                 </button>
             </div>
         </div>

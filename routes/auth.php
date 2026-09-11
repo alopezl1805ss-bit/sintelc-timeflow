@@ -5,8 +5,9 @@ use Illuminate\Support\Facades\Route;
 use Livewire\Volt\Volt;
 
 Route::middleware('guest')->group(function () {
-    Volt::route('register', 'pages.auth.register')
-        ->name('register');
+    // El registro público se cerró el 2026-09-11: creaba cuentas con
+    // role='admin' (default de la migración 2026_07_01_000001). Los usuarios
+    // los da de alta un admin desde clients/{id} → Usuarios.
 
     Volt::route('login', 'pages.auth.login')
         ->name('login');
