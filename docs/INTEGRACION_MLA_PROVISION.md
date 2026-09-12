@@ -4,6 +4,10 @@
 
 **Flujo objetivo:** cámara Provision → API/export de Provision → **FlowTime** → Factorial.
 
+> **📎 Anexo técnico (7 sep 2026):** ya llegaron los SDKs y la documentación de APIs (E1, E4). El análisis, la especificación de la integración y el presupuesto están en **[INTEGRACION_PROVISION_ESPECIFICACION_Y_PRESUPUESTO.md](INTEGRACION_PROVISION_ESPECIFICACION_Y_PRESUPUESTO.md)**. Resumen: hay webhooks (E3 ✅), se puede consultar el padrón de rostros (E7 ✅), los SDKs son Windows-only y se ratifica no usarlos (E4 ✅). Queda una incógnita que define la arquitectura — si el modo push autónomo entrega identidad o sólo detección anónima.
+
+> **💰 Propuesta comercial (9 sep 2026):** estructura acordada por Daniel — **$20,000 MXN de activación + $5 MXN por empleado activo al mes**, adicionales a la tarifa vigente; **Isra factura**. El documento está en **[PROPUESTA_MLA_RECONOCIMIENTO_FACIAL.md](PROPUESTA_MLA_RECONOCIMIENTO_FACIAL.md)** — Parte A es lo que se envía a MLA, Parte B es la nota interna para Isra (punto de equilibrio, supuestos y lo que no se recorta). Sustituye, para MLA, el escenario de "entrada baja" de §11.5 del anexo técnico.
+
 > **Cómo usar este archivo:** conforme lleguen SDKs, documentación, archivos de ejemplo o correos, se pegan o se referencian en la **Bitácora** (final del documento) y de ahí se integran a las secciones correspondientes. La idea es que este sea el único lugar donde se busque cualquier cosa de esta integración.
 
 ---
