@@ -96,13 +96,20 @@ new class extends Component {
         $sello = 'Descartado manualmente por ' . ($user?->name ?? 'sistema')
             . ' (' . ($user?->email ?? 'sin usuario') . ') el ' . now()->format('Y-m-d H:i');
 
+        // RevisiÃ³n H01, condiciÃ³n A1: no se toca sync_error (es la evidencia de por
+        // quÃ© fallÃ³). La marca va delante y la nota previa detrÃ¡s, recortado a los
+        // 255 caracteres de la columna.
         AttendanceLog::where('sync_status', 'failed')
             ->when($this->clientFilterId, fn($q) => $q->where('client_id', $this->clientFilterId))
-            ->update([
-                'sync_status' => 'descartado',
-                'sync_error'  => null,
-                'sync_note'   => $sello,
-            ]);
+            ->select(['id', 'sync_note'])
+            ->lazyById(500)
+            ->each(function ($log) use ($sello) {
+                $nota = $log->sync_note ? $sello . ' Â· antes: ' . $log->sync_note : $sello;
+                AttendanceLog::whereKey($log->id)->update([
+                    'sync_status' => 'descartado',
+                    'sync_note'   => mb_substr($nota, 0, 255),
+                ]);
+            });
 
         Cache::forget('stats.failed_sync');
         Cache::forget('stats.pending_sync');

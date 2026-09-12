@@ -36,7 +36,21 @@ class ResolvePendingAttendanceLogs extends Command
 
     public function handle(): int
     {
-        $clientFilter = $this->option('client') ? (int) $this->option('client') : null;
+        // RevisiÃ³n H01, condiciÃ³n A2: un --client mal escrito (Â«abcÂ», Â«0Â», un id
+        // que no existe) antes se convertÃ­a en Â«todos los clientesÂ». Ahora aborta.
+        $clientOpt    = $this->option('client');
+        $clientFilter = null;
+        if ($clientOpt !== null && $clientOpt !== '') {
+            if (!ctype_digit((string) $clientOpt) || (int) $clientOpt === 0) {
+                $this->error("--client debe ser el id numÃ©rico de un cliente; recibÃ­ Â«{$clientOpt}Â». No se hizo nada.");
+                return self::INVALID;
+            }
+            $clientFilter = (int) $clientOpt;
+            if (!\App\Models\Client::whereKey($clientFilter)->exists()) {
+                $this->error("No existe el cliente {$clientFilter}. No se hizo nada.");
+                return self::INVALID;
+            }
+        }
         $dryRun       = (bool) $this->option('dry-run');
 
         if ($dryRun) {

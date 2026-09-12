@@ -169,4 +169,26 @@ class AttendanceStatsTest extends TestCase
         $this->assertSame('pending', $log->refresh()->sync_status);
         Queue::assertNothingPushed();
     }
+
+    public function test_descartar_conserva_el_motivo_del_fallo_y_la_nota_previa(): void
+    {
+        $a = $this->empresa('conserva');
+        $empleado = $this->empleado($a, 56, 'Empleado Conserva');
+        $log = $this->marcaje($a, 'failed', $empleado->id);
+        AttendanceLog::whereKey($log->id)->update([
+            'sync_error' => 'Sin turno abierto para sobreescribir',
+            'sync_note'  => 'overwrite (api)',
+        ]);
+
+        $admin = $this->admin();
+        $this->actingAs($admin);
+        Volt::test('dashboard.attendance-stats')->call('dismissFailed');
+
+        $log->refresh();
+        $this->assertSame('descartado', $log->sync_status);
+        $this->assertSame('Sin turno abierto para sobreescribir', $log->sync_error, 'El motivo del fallo es evidencia: no se borra');
+        $this->assertStringContainsString($admin->name, (string) $log->sync_note);
+        $this->assertStringContainsString('overwrite (api)', (string) $log->sync_note);
+        $this->assertLessThanOrEqual(255, mb_strlen((string) $log->sync_note));
+    }
 }

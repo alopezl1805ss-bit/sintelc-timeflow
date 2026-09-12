@@ -235,4 +235,19 @@ class ResolvePendingAttendanceLogsTest extends TestCase
         $this->assertSame('pending', $log->sync_status);
         Queue::assertNothingPushed();
     }
+
+    public function test_client_no_numerico_aborta_sin_tocar_nada(): void
+    {
+        Queue::fake();
+        $this->assertSame(\Illuminate\Console\Command::INVALID, Artisan::call('attendance:resolve-pending', ['--client' => 'abc']));
+        $this->assertSame(\Illuminate\Console\Command::INVALID, Artisan::call('attendance:resolve-pending', ['--client' => '0']));
+        Queue::assertNothingPushed();
+    }
+
+    public function test_client_inexistente_aborta_sin_tocar_nada(): void
+    {
+        Queue::fake();
+        $this->assertSame(\Illuminate\Console\Command::INVALID, Artisan::call('attendance:resolve-pending', ['--client' => '999999']));
+        Queue::assertNothingPushed();
+    }
 }
