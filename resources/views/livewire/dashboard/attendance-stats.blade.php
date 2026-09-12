@@ -24,8 +24,22 @@ new class extends Component {
     public int $devOffline  = 0;
     public int $devInactive = 0;
 
-    public function mount(): void
+    /**
+     * Cliente que se está viendo. Null = tablero global de admin.
+     *
+     * Incidencia H01: las acciones de este tablero (reintentar / descartar)
+     * actuaban sobre los registros de TODOS los clientes a la vez. Con PIN
+     * repetidos entre empresas eso era la vía de entrada a la nómina cruzada.
+     */
+    public ?int $clientFilterId = null;
+
+    public function mount(?int $clientFilterId = null): void
     {
+        // Un usuario de tipo cliente siempre queda acotado a su propia empresa.
+        $this->clientFilterId = auth()->user()?->isClient()
+            ? auth()->user()->client_id
+            : $clientFilterId;
+
         $this->loadStats();
     }
 
@@ -69,32 +83,71 @@ new class extends Component {
         });
     }
 
+    /**
+     * Descartar ya NO borra: marca `descartado` con nota y usuario.
+     *
+     * Antes hacía `delete()` físico de todos los `failed` de todos los
+     * clientes: se perdía la evidencia de qué marcaje había fallado y de a
+     * quién pertenecía, justo lo que hace falta para auditar H01.
+     */
     public function dismissFailed(): void
     {
-        AttendanceLog::where('sync_status', 'failed')->delete();
+        $user = auth()->user();
+        $sello = 'Descartado manualmente por ' . ($user?->name ?? 'sistema')
+            . ' (' . ($user?->email ?? 'sin usuario') . ') el ' . now()->format('Y-m-d H:i');
+
+        AttendanceLog::where('sync_status', 'failed')
+            ->when($this->clientFilterId, fn($q) => $q->where('client_id', $this->clientFilterId))
+            ->update([
+                'sync_status' => 'descartado',
+                'sync_error'  => null,
+                'sync_note'   => $sello,
+            ]);
+
         Cache::forget('stats.failed_sync');
         Cache::forget('stats.pending_sync');
         $this->loadStats();
         $this->dispatch('stats-refreshed');
     }
 
+    /** El reintento global quedó desactivado por H01: sólo se reintenta un cliente concreto. */
+    public function canRetryPending(): bool
+    {
+        return $this->clientFilterId !== null;
+    }
+
     public function retryPending(): void
     {
+        // Sin cliente en contexto no hay reintento: un reintento global es lo
+        // que propagó la nómina cruzada de H01.
+        if (!$this->canRetryPending()) {
+            return;
+        }
+
         $delay = 0;
 
-        // Los que ya tienen employee mapeado → despachar directo
+        // Los que ya tienen employee mapeado → despachar directo, pero sólo si
+        // ese empleado es de la misma empresa que el registro.
         AttendanceLog::where('sync_status', 'pending')
+            ->where('client_id', $this->clientFilterId)
             ->whereNotNull('factorial_employee_id')
             ->orderBy('occurred_at')
-            ->pluck('id')
-            ->each(function ($id) use (&$delay) {
-                AttendanceLog::where('id', $id)->update(['sync_status' => 'resolved']);
-                SyncAttendanceToFactorial::dispatch($id)->delay(now()->addSeconds($delay));
+            ->get(['id', 'client_id', 'factorial_employee_id'])
+            ->each(function ($log) use (&$delay) {
+                if (!\App\Services\AttendanceEmployeeGuard::canDispatch($log, 'dashboard:retryPending')) {
+                    return;
+                }
+
+                AttendanceLog::where('id', $log->id)->update(['sync_status' => 'resolved']);
+                SyncAttendanceToFactorial::dispatch($log->id)->delay(now()->addSeconds($delay));
                 $delay += 2;
             });
 
-        // Los sin mapeo + los resolved huérfanos → resolve-pending los toma
-        \Illuminate\Support\Facades\Artisan::call('attendance:resolve-pending');
+        // Los sin mapeo + los resolved huérfanos → resolve-pending los toma,
+        // acotado al mismo cliente.
+        \Illuminate\Support\Facades\Artisan::call('attendance:resolve-pending', [
+            '--client' => $this->clientFilterId,
+        ]);
 
         Cache::forget('stats.pending_sync');
         $this->loadStats();
@@ -124,7 +177,16 @@ new class extends Component {
         AttendanceLog::where('sync_status', 'failed')
             ->where('occurred_at', '>=', $quincenaStart)
             ->chunkById(50, function ($logs) use (&$delay) {
-                $ids = $logs->pluck('id');
+                // Mismo guardarraíl H01: un `failed` pudo quedar con el
+                // empleado de otra empresa; reintentarlo lo mandaría a su
+                // Factorial.
+                $ids = $logs
+                    ->filter(fn($log) => \App\Services\AttendanceEmployeeGuard::canDispatch($log, 'dashboard:retryFailed'))
+                    ->pluck('id');
+
+                if ($ids->isEmpty()) {
+                    return;
+                }
 
                 AttendanceLog::whereIn('id', $ids)->update([
                     'sync_status' => 'resolved',
@@ -205,11 +267,17 @@ new class extends Component {
                     </div>
                     @if($pendingSync > 0)
                     <div class="flex items-center gap-3 mt-1 pl-5">
+                        @if($clientFilterId)
                         <button wire:click="retryPending" wire:loading.attr="disabled"
                             class="text-xs text-amber-500 hover:text-amber-700 disabled:opacity-40 transition">
                             <span wire:loading.remove wire:target="retryPending">Reintentar</span>
                             <span wire:loading wire:target="retryPending">...</span>
                         </button>
+                        @else
+                        <span class="text-xs text-gray-400" title="El reintento global asignaba empleados de otra empresa a PIN repetidos (incidencia H01). Reintenta desde la ficha de cada cliente.">
+                            Reintento global temporalmente desactivado — ver incidencia H01
+                        </span>
+                        @endif
                     </div>
                     @endif
                 </div>
@@ -228,8 +296,9 @@ new class extends Component {
                             <span wire:loading.remove wire:target="retryFailed">Reintentar</span>
                             <span wire:loading wire:target="retryFailed">...</span>
                         </button>
-                        <button wire:click="dismissFailed" wire:confirm="¿Descartar los {{ $failedSync }} errores?" wire:loading.attr="disabled"
-                            class="text-xs text-gray-400 hover:text-gray-600 disabled:opacity-40 transition">
+                        <button wire:click="dismissFailed" wire:confirm="Se marcarán {{ $failedSync }} registros como descartados (no se borran). ¿Continuar?" wire:loading.attr="disabled"
+                            class="text-xs text-gray-400 hover:text-gray-600 disabled:opacity-40 transition"
+                            title="Marca los errores como «descartado» con nota y usuario. No borra nada.">
                             Descartar
                         </button>
                     </div>
