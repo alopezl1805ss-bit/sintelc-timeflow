@@ -136,7 +136,7 @@ new class extends Component {
             {{-- Estado pills --}}
             <div class="flex items-center gap-2">
                 <span class="text-xs text-gray-400 mr-1">Estado:</span>
-                @foreach(['' => 'Todos', 'synced' => 'Sincronizado', 'pending' => 'Pendiente', 'resolved' => 'En proceso', 'failed' => 'Fallido', 'descartado' => 'Descartado'] as $val => $label)
+                @foreach(['' => 'Todos', 'synced' => 'Sincronizado', 'pending' => 'Pendiente', 'resolved' => 'En proceso', 'failed' => 'Fallido', 'descartado' => 'Descartado', 'retenido' => 'Retenido'] as $val => $label)
                 <button wire:click="$set('statusFilter', '{{ $val }}')"
                     class="px-3 py-1 rounded-full text-xs font-medium transition-colors
                         {{ $statusFilter === $val
@@ -214,8 +214,8 @@ new class extends Component {
                         </td>
                         <td class="px-5 py-3 whitespace-nowrap">
                             @php
-                                $statusColors = ['pending'=>'bg-yellow-100 text-yellow-800','resolved'=>'bg-blue-100 text-blue-800','synced'=>'bg-green-100 text-green-800','failed'=>'bg-red-100 text-red-800','incomplete'=>'bg-gray-100 text-gray-600','descartado'=>'bg-gray-100 text-gray-400'];
-                                $statusLabels = ['pending'=>'Pendiente','resolved'=>'En proceso','synced'=>'Sincronizado','failed'=>'Fallido','incomplete'=>'Incompleto','descartado'=>'Descartado'];
+                                $statusColors = ['pending'=>'bg-yellow-100 text-yellow-800','resolved'=>'bg-blue-100 text-blue-800','synced'=>'bg-green-100 text-green-800','failed'=>'bg-red-100 text-red-800','incomplete'=>'bg-gray-100 text-gray-600','descartado'=>'bg-gray-100 text-gray-400','retenido'=>'bg-slate-100 text-slate-600'];
+                                $statusLabels = ['pending'=>'Pendiente','resolved'=>'En proceso','synced'=>'Sincronizado','failed'=>'Fallido','incomplete'=>'Incompleto','descartado'=>'Descartado','retenido'=>'Retenido'];
                                 // Los cierres automáticos (attendance:close-forgotten-shifts) escriben una
                                 // nota con este prefijo — se muestra visible bajo el badge, no solo al pasar
                                 // el mouse, porque son casos que a veces necesitan revisión humana.

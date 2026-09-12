@@ -35,7 +35,16 @@ class SyncAttendanceToFactorial implements ShouldQueue
      */
     private const MAX_SHIFT_HOURS_CEILING = 23;
 
-    /** true en cuanto este intento dejó el registro en synced o failed (H02). */
+    public const HOLD_NOTE = 'Retenido: la sincronización de este cliente está en pausa';
+
+    /** ¿El cliente está en attendance.sync_hold_clients? */
+    public static function clientOnHold(int|string|null $clientId): bool
+    {
+        return $clientId !== null
+            && in_array((int) $clientId, array_map('intval', (array) config('attendance.sync_hold_clients', [])), true);
+    }
+
+    /** true en cuanto este intento dejó el registro en synced/failed/retenido (H02). */
     private bool $settled = false;
 
     public function __construct(
@@ -63,6 +72,23 @@ class SyncAttendanceToFactorial implements ShouldQueue
         // las que ya lo llamaban antes de despachar.
         if (!AttendanceEmployeeGuard::canDispatch($log, 'SyncAttendanceToFactorial')) {
             $this->fail($log, "Guardarraíl H01: el empleado {$log->factorial_employee_id} no pertenece al cliente {$log->client_id} de este registro; no se envió a Factorial");
+            return;
+        }
+
+        // Retención por cliente (ATTENDANCE_SYNC_HOLD_CLIENTS): el marcaje se
+        // guarda como `retenido` y NO se llama a Factorial. Nada se pierde: se
+        // libera con `attendance:liberar-retenidos --client=<id>`.
+        if (self::clientOnHold($log->client_id)) {
+            $log->update([
+                'sync_status' => 'retenido',
+                'sync_note'   => self::HOLD_NOTE,
+            ]);
+            $this->settled = true;
+
+            Log::info('SyncAttendanceToFactorial: retenido (cliente en pausa)', [
+                'attendance_log_id' => $log->id,
+                'client_id'         => $log->client_id,
+            ]);
             return;
         }
 
@@ -263,7 +289,12 @@ class SyncAttendanceToFactorial implements ShouldQueue
                 // Con etiquetas invertidas (EPRECSA) es una salida marcada como
                 // entrada; tiene que verse, no descartarse.
                 $shown = $clockInAt->isSameDay($punchAt) ? $clockInAt->format('H:i') : $since;
-                $this->fail($log, "Entrada posterior a la ya registrada ({$shown}); posible salida marcada como entrada. Turno Factorial {$shift['id']}. Error original: {$primaryError}");
+
+                // P2: en un break_out no es una salida mal etiquetada: es la
+                // vuelta de una pausa cuya salida (break_in) no cerró el turno.
+                $this->fail($log, $log->check_type === 'break_out'
+                    ? "Regreso de pausa con el turno de la entrada ({$shown}) aún abierto: la salida a pausa no se registró; no se mueve la entrada. Turno Factorial {$shift['id']}. Error original: {$primaryError}"
+                    : "Entrada posterior a la ya registrada ({$shown}); posible salida marcada como entrada. Turno Factorial {$shift['id']}. Error original: {$primaryError}");
                 return;
             }
 

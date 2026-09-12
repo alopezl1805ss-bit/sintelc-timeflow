@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Jobs\CloseForgottenShiftJob;
+use App\Jobs\SyncAttendanceToFactorial;
 use App\Models\ClientAttendanceConfig;
 use App\Models\FactorialConnection;
 use App\Models\FactorialEmployee;
@@ -48,6 +49,12 @@ class CloseForgottenShifts extends Command
         foreach ($connections as $connection) {
             $config = $clientConfigs[$connection->client_id] ?? null;
             if (!$config) continue;
+
+            // Cliente retenido: el cierre también escribe en Factorial.
+            if (SyncAttendanceToFactorial::clientOnHold($connection->client_id)) {
+                $this->warn("Conexión #{$connection->id}: cliente {$connection->client_id} retenido (ATTENDANCE_SYNC_HOLD_CLIENTS), se salta.");
+                continue;
+            }
 
             $totalClosed += $this->processConnection($connection, $config);
         }

@@ -12,6 +12,7 @@ use Illuminate\Foundation\Testing\RefreshDatabase;
 use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Tests\TestCase;
 
 class CloseForgottenShiftsCommandTest extends TestCase
@@ -271,6 +272,80 @@ class CloseForgottenShiftsCommandTest extends TestCase
             && $job->closeAt === '2026-08-16 14:00:00'
             && $job->reason === 'sin_horario'
             && $job->checkinOnly === true);
+    }
+
+    public function test_cierre_automatico_salta_cliente_retenido(): void
+    {
+        Carbon::setTestNow('2026-08-16 21:00:00');
+        Bus::fake();
+
+        [$employee] = $this->makeClientWithEmployee(autoClose: true, checkinOnly: true);
+        config(['attendance.sync_hold_clients' => [(int) $employee->client_id]]);
+
+        $this->fakeOpenShiftsAndEstimatedTimes(
+            employeeFactorialId: $employee->factorial_id, date: '2026-08-16', clockIn: '08:00:00', expectedMinutes: 480, shiftId: 940,
+        );
+
+        $this->artisan('attendance:close-forgotten-shifts')->assertExitCode(0);
+
+        Bus::assertNotDispatched(CloseForgottenShiftJob::class);
+        Http::assertNothingSent();
+    }
+
+    public function test_lote_truncado_se_parte_y_se_reintenta(): void
+    {
+        Carbon::setTestNow('2026-08-16 21:00:00');
+        Bus::fake();
+
+        $employees = $this->makeConnectionWithEmployees(20, checkinOnly: true);
+        $calls     = [];
+
+        Http::fake(function (Request $request) use (&$calls) {
+            parse_str(parse_url($request->url(), PHP_URL_QUERY), $q);
+            $ids = $q['employee_ids'] ?? [];
+
+            if (str_starts_with($request->url(), self::OPEN_SHIFTS_URL)) {
+                $calls[] = count($ids);
+
+                // Más de 10 empleados por llamada ⇒ «página 1 de varias».
+                return Http::response([
+                    'data' => array_map(fn ($id) => ['id' => 5000 + (int) $id % 1000, 'employee_id' => (int) $id, 'date' => '2026-08-16', 'clock_in' => '2000-01-01T08:00:00.000Z', 'clock_out' => null, 'status' => 'opened'], array_slice($ids, 0, 5)),
+                    'meta' => ['has_next_page' => count($ids) > 10],
+                ], 200);
+            }
+
+            return Http::response(['data' => array_map(fn ($id) => ['date' => '2026-08-16', 'source' => 'work_schedule', 'employee_id' => (int) $id, 'expected_minutes' => 480], $ids), 'meta' => ['has_next_page' => false]], 200);
+        });
+
+        $this->artisan('attendance:close-forgotten-shifts')->assertExitCode(0);
+
+        // 20 → truncado → 10 + 10, cada mitad completa (5 turnos abiertos cada una).
+        $this->assertSame([20, 10, 10], $calls);
+        Bus::assertDispatchedTimes(CloseForgottenShiftJob::class, 10);
+    }
+
+    public function test_lote_truncado_al_piso_registra_critical_y_no_cierra(): void
+    {
+        Carbon::setTestNow('2026-08-16 21:00:00');
+        Bus::fake();
+        Log::spy();
+
+        $this->makeConnectionWithEmployees(20, checkinOnly: true);
+
+        Http::fake(function (Request $request) {
+            parse_str(parse_url($request->url(), PHP_URL_QUERY), $q);
+            $ids = $q['employee_ids'] ?? [];
+
+            return Http::response([
+                'data' => array_map(fn ($id) => ['id' => 6000 + (int) $id % 1000, 'employee_id' => (int) $id, 'date' => '2026-08-16', 'clock_in' => '2000-01-01T08:00:00.000Z', 'clock_out' => null, 'status' => 'opened'], $ids),
+                'meta' => ['has_next_page' => true],
+            ], 200);
+        });
+
+        $this->artisan('attendance:close-forgotten-shifts')->assertExitCode(0);
+
+        Bus::assertNotDispatched(CloseForgottenShiftJob::class);
+        Log::shouldHaveReceived('critical')->withArgs(fn ($msg, $ctx) => str_contains($msg, 'open_shifts sigue truncado') && $ctx['empleados'] === 10)->twice();
     }
 
     /** @return list<FactorialEmployee> */

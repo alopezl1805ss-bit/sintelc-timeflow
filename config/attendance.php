@@ -112,4 +112,26 @@ return [
 
     'max_shift_hours' => (int) env('ATTENDANCE_MAX_SHIFT_HOURS', 20),
 
+    /*
+    |--------------------------------------------------------------------------
+    | Clientes con la sincronización retenida
+    |--------------------------------------------------------------------------
+    |
+    | ATTENDANCE_SYNC_HOLD_CLIENTS=15,20 (ids separados por comas; vacío por
+    | defecto). Sus marcajes se siguen recibiendo y guardando, pero el job los
+    | deja en `retenido` sin llamar a Factorial, y el cierre automático salta
+    | sus conexiones. Nada se pierde: al quitar el id de la lista (y correr
+    | config:cache) se liberan con
+    |   php artisan attendance:liberar-retenidos --client=<id>
+    |
+    | Motivo (2026-09-12): EPRECSA (#15) tiene Entrada/Salida invertidas en el
+    | equipo; cada día sincronizado crea turnos nocturnos fantasma en nómina.
+    |
+    */
+
+    'sync_hold_clients' => array_values(array_map('intval', array_filter(
+        array_map('trim', explode(',', (string) env('ATTENDANCE_SYNC_HOLD_CLIENTS', ''))),
+        fn ($v) => ctype_digit($v) && (int) $v > 0
+    ))),
+
 ];

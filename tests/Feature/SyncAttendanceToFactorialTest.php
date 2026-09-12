@@ -512,6 +512,62 @@ class SyncAttendanceToFactorialTest extends TestCase
         Http::assertNothingSent();
     }
 
+    // ── Condiciones de la revisión D1: retención y mensaje de break_out ──
+
+    public function test_cliente_retenido_no_envia_nada_y_los_demas_siguen_igual(): void
+    {
+        [$retenido] = $this->makeLog(checkType: 'check_in');
+        [$normal]   = $this->makeLog(checkType: 'check_in');
+
+        config(['attendance.sync_hold_clients' => [(int) $retenido->client_id]]);
+
+        Http::fake([self::CLOCK_IN_URL => Http::response(['id' => 556, 'employee_id' => 111], 200)]);
+
+        (new SyncAttendanceToFactorial($retenido->id))->handle();
+
+        $retenido->refresh();
+        $this->assertSame('retenido', $retenido->sync_status);
+        $this->assertSame(SyncAttendanceToFactorial::HOLD_NOTE, $retenido->sync_note);
+        $this->assertNull($retenido->factorial_shift_id);
+        Http::assertNothingSent();
+
+        (new SyncAttendanceToFactorial($normal->id))->handle();
+
+        $normal->refresh();
+        $this->assertSame('synced', $normal->sync_status);
+        $this->assertSame('directo', $normal->sync_note);
+        Http::assertSentCount(1);
+    }
+
+    public function test_break_out_frenado_dice_que_falta_la_salida_a_pausa(): void
+    {
+        [$log, $employee] = $this->makeLog(checkType: 'break_out', occurredAt: '2026-07-24 14:00:00');
+
+        Http::fake(function (Request $request) use ($employee) {
+            if ($request->url() === self::CLOCK_IN_URL) {
+                return Http::response(['errors' => ['exception' => ['No fue posible registrar la asistencia. Ya existe un turno en curso.']]], 409);
+            }
+
+            if ($request->method() === 'GET' && str_starts_with($request->url(), self::OPEN_SHIFTS_URL)) {
+                return Http::response(['data' => [$this->openShift(907, $employee->factorial_id, '2026-07-24', '08:00:00')]], 200);
+            }
+
+            if ($request->method() === 'GET' && str_starts_with($request->url(), self::SHIFTS_URL)) {
+                return Http::response(['data' => []], 200);
+            }
+
+            return Http::response(['id' => 907], 200);
+        });
+
+        (new SyncAttendanceToFactorial($log->id))->handle();
+
+        $log->refresh();
+        $this->assertSame('failed', $log->sync_status);
+        $this->assertStringContainsString('Regreso de pausa con el turno de la entrada (08:00) aún abierto: la salida a pausa no se registró', $log->sync_error);
+        $this->assertStringNotContainsString('posible salida marcada como entrada', $log->sync_error);
+        Http::assertNotSent(fn (Request $request) => $request->method() === 'PUT');
+    }
+
     private function openShift(int $id, int $employeeFactorialId, string $date, string $clockIn, ?string $inSource = null): array
     {
         return [

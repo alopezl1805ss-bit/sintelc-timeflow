@@ -314,27 +314,10 @@ class FactorialService
      */
     public function fetchOpenShifts(array $employeeIds): array
     {
-        $data      = [];
-        $truncated = [];
-
-        foreach (array_chunk($employeeIds, self::MAX_EMPLOYEE_IDS_PER_REQUEST) as $chunk) {
-            $response = $this->request(
-                'get',
-                '/api/2026-04-01/resources/attendance/open_shifts',
-                ['query' => $this->buildQuery(['employee_ids' => $chunk])]
-            )->json();
-
-            $data = array_merge($data, $response['data'] ?? []);
-
-            if ($this->pageIsTruncated($response, 'open_shifts', $chunk)) {
-                $truncated = array_merge($truncated, $chunk);
-            }
-        }
-
-        return ['data' => $data, 'truncated_ids' => $truncated];
+        return $this->fetchUntruncated('/api/2026-04-01/resources/attendance/open_shifts', 'open_shifts', $employeeIds, []);
     }
 
-    /** Sólo los datos; si la respuesta vino truncada queda un warning en el log. */
+    /** Sólo los datos; un lote truncado al piso queda en Log::critical. */
     public function getOpenShifts(array $employeeIds): array
     {
         return $this->fetchOpenShifts($employeeIds)['data'];
@@ -356,50 +339,80 @@ class FactorialService
      */
     public function fetchEstimatedTimes(array $employeeIds, string $startOn, string $endOn): array
     {
-        $data      = [];
-        $truncated = [];
-
-        foreach (array_chunk($employeeIds, self::MAX_EMPLOYEE_IDS_PER_REQUEST) as $chunk) {
-            $response = $this->request(
-                'get',
-                '/api/2026-04-01/resources/attendance/estimated_times',
-                ['query' => $this->buildQuery([
-                    'employee_ids' => $chunk,
-                    'start_on'     => $startOn,
-                    'end_on'       => $endOn,
-                ])]
-            )->json();
-
-            $data = array_merge($data, $response['data'] ?? []);
-
-            if ($this->pageIsTruncated($response, 'estimated_times', $chunk, ['start_on' => $startOn, 'end_on' => $endOn])) {
-                $truncated = array_merge($truncated, $chunk);
-            }
-        }
-
-        return ['data' => $data, 'truncated_ids' => $truncated];
+        return $this->fetchUntruncated('/api/2026-04-01/resources/attendance/estimated_times', 'estimated_times', $employeeIds, [
+            'start_on' => $startOn,
+            'end_on'   => $endOn,
+        ]);
     }
 
-    /** Sólo los datos; si la respuesta vino truncada queda un warning en el log. */
+    /** Sólo los datos; un lote truncado al piso queda en Log::critical. */
     public function getEstimatedTimes(array $employeeIds, string $startOn, string $endOn): array
     {
         return $this->fetchEstimatedTimes($employeeIds, $startOn, $endOn)['data'];
     }
 
-    private function pageIsTruncated(mixed $response, string $endpoint, array $chunk, array $context = []): bool
+    // Piso al partir un lote truncado (P4): por debajo de esto, un lote que
+    // sigue trayendo has_next_page no se parte más y se da por incompleto.
+    private const MIN_SPLIT_BATCH = 10;
+
+    /**
+     * Pide un endpoint por lotes de employee_ids. Si un lote vuelve con
+     * meta.has_next_page=true (sólo se lee la página 1), se descarta esa
+     * página y el lote se parte en dos y se reintenta (80 → 40 → 20 → 10).
+     * Si al piso sigue truncado: Log::critical y sus empleados se devuelven
+     * en `truncated_ids` para que quien llama no decida con datos incompletos.
+     *
+     * @return array{data: list<array>, truncated_ids: list<int|string>}
+     */
+    private function fetchUntruncated(string $uri, string $endpoint, array $employeeIds, array $extraQuery): array
+    {
+        $data      = [];
+        $truncated = [];
+        $queue     = array_chunk(array_values($employeeIds), self::MAX_EMPLOYEE_IDS_PER_REQUEST);
+
+        while ($queue !== []) {
+            $chunk    = array_shift($queue);
+            $response = $this->request(
+                'get',
+                $uri,
+                ['query' => $this->buildQuery(array_merge(['employee_ids' => $chunk], $extraQuery))]
+            )->json();
+
+            if (!$this->pageIsTruncated($response)) {
+                $data = array_merge($data, $response['data'] ?? []);
+                continue;
+            }
+
+            if (count($chunk) > self::MIN_SPLIT_BATCH) {
+                $half = (int) ceil(count($chunk) / 2);
+                array_unshift($queue, array_slice($chunk, 0, $half), array_slice($chunk, $half));
+
+                Log::warning("FactorialService: {$endpoint} truncado (has_next_page=true), se parte el lote y se reintenta", array_merge([
+                    'connection_id' => $this->connection->id,
+                    'empleados'     => count($chunk),
+                ], $extraQuery));
+                continue;
+            }
+
+            // Al piso y sigue truncado: se conserva lo que vino (no se usa para
+            // decidir) y se marca el sub-lote como incompleto.
+            $data      = array_merge($data, $response['data'] ?? []);
+            $truncated = array_merge($truncated, $chunk);
+
+            Log::critical("FactorialService: {$endpoint} sigue truncado con el lote mínimo — esos empleados quedan sin decidir", array_merge([
+                'connection_id' => $this->connection->id,
+                'empleados'     => count($chunk),
+                'filas'         => is_array($response['data'] ?? null) ? count($response['data']) : null,
+            ], $extraQuery));
+        }
+
+        return ['data' => $data, 'truncated_ids' => $truncated];
+    }
+
+    private function pageIsTruncated(mixed $response): bool
     {
         $meta = is_array($response) ? ($response['meta'] ?? []) : [];
 
-        if (!is_array($meta) || !filter_var($meta['has_next_page'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
-            return false;
-        }
-
-        Log::warning("FactorialService: {$endpoint} devolvió has_next_page=true — sólo se leyó la primera página, lote tratado como incompleto", array_merge([
-            'connection_id' => $this->connection->id,
-            'empleados'     => count($chunk),
-            'filas'         => is_array($response['data'] ?? null) ? count($response['data']) : null,
-        ], $context));
-
-        return true;
+        return is_array($meta) && filter_var($meta['has_next_page'] ?? false, FILTER_VALIDATE_BOOLEAN);
     }
 }
