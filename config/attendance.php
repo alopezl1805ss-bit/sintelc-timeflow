@@ -95,4 +95,21 @@ return [
         21,  // ACERMEX
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Duración máxima de un turno que el fallback puede tocar (horas)
+    |--------------------------------------------------------------------------
+    |
+    | Cuando Factorial rechaza el marcaje directo, SyncAttendanceToFactorial
+    | busca el turno abierto del empleado (open_shifts, sea de la fecha que
+    | sea). Sólo lo cierra o lo adelanta si su clock_in está a menos de estas
+    | horas del marcaje. Un turno más viejo NO se toca: el registro queda
+    | `failed` con la nota «Turno abierto desde … bloquea este marcaje» (cerrarlo
+    | crearía un turno de varios días). 20 h cubre un turno nocturno de 12 h con
+    | holgura. Techo duro de 23 h en el job: updateShift() sólo manda la hora.
+    |
+    */
+
+    'max_shift_hours' => (int) env('ATTENDANCE_MAX_SHIFT_HOURS', 20),
+
 ];

@@ -46,9 +46,12 @@ class FactorialService
 
     private function doRequest(string $method, string $url, array $options, string $token): Response
     {
+        // R12 (mínimo): sin connectTimeout un host que no contesta retenía al
+        // worker 30 s por llamada. El tipado y el circuit breaker van en la sombra.
         $request = Http::withToken($token)
             ->acceptJson()
-            ->timeout(30);
+            ->connectTimeout(5)
+            ->timeout(20);
 
         return match (strtolower($method)) {
             'get'    => $request->get($url, $options['query'] ?? []),
@@ -91,7 +94,7 @@ class FactorialService
                 );
             }
 
-            $response = Http::asForm()->post(
+            $response = Http::asForm()->connectTimeout(5)->timeout(20)->post(
                 $this->baseUrl() . '/oauth/token',
                 [
                     'grant_type'    => 'refresh_token',
@@ -301,10 +304,18 @@ class FactorialService
      * a mano — el endpoint ya solo devuelve turnos con status "opened").
      * Verificado contra la API real en agosto 2026 (funciona en 2026-04-01
      * y en 2026-07-01). Trocea employee_ids en lotes automáticamente.
+     *
+     * Factorial pagina a 100 filas y aquí sólo se lee la primera página (el
+     * parámetro de la página 2 no se encontró, 2026-09-11). Por eso se lee
+     * `meta.has_next_page`: los empleados de un lote truncado se devuelven en
+     * `truncated_ids` para que quien llama no decida con datos incompletos.
+     *
+     * @return array{data: list<array>, truncated_ids: list<int|string>}
      */
-    public function getOpenShifts(array $employeeIds): array
+    public function fetchOpenShifts(array $employeeIds): array
     {
-        $results = [];
+        $data      = [];
+        $truncated = [];
 
         foreach (array_chunk($employeeIds, self::MAX_EMPLOYEE_IDS_PER_REQUEST) as $chunk) {
             $response = $this->request(
@@ -313,10 +324,20 @@ class FactorialService
                 ['query' => $this->buildQuery(['employee_ids' => $chunk])]
             )->json();
 
-            $results = array_merge($results, $response['data'] ?? []);
+            $data = array_merge($data, $response['data'] ?? []);
+
+            if ($this->pageIsTruncated($response, 'open_shifts', $chunk)) {
+                $truncated = array_merge($truncated, $chunk);
+            }
         }
 
-        return $results;
+        return ['data' => $data, 'truncated_ids' => $truncated];
+    }
+
+    /** Sólo los datos; si la respuesta vino truncada queda un warning en el log. */
+    public function getOpenShifts(array $employeeIds): array
+    {
+        return $this->fetchOpenShifts($employeeIds)['data'];
     }
 
     /**
@@ -325,10 +346,18 @@ class FactorialService
      * ahí. Evita que le preguntemos al cliente algo que ya definió en Factorial.
      * Verificado contra la API real en agosto 2026. Trocea employee_ids en
      * lotes automáticamente (mismo motivo que getOpenShifts()).
+     *
+     * Misma paginación a 100 filas que open_shifts (riesgo R01): una fila por
+     * empleado y día, así que un lote de 80 empleados × 2 días ya se trunca.
+     * Pedir UNA fecha por llamada lo evita; `truncated_ids` avisa si aun así
+     * pasa.
+     *
+     * @return array{data: list<array>, truncated_ids: list<int|string>}
      */
-    public function getEstimatedTimes(array $employeeIds, string $startOn, string $endOn): array
+    public function fetchEstimatedTimes(array $employeeIds, string $startOn, string $endOn): array
     {
-        $results = [];
+        $data      = [];
+        $truncated = [];
 
         foreach (array_chunk($employeeIds, self::MAX_EMPLOYEE_IDS_PER_REQUEST) as $chunk) {
             $response = $this->request(
@@ -341,9 +370,36 @@ class FactorialService
                 ])]
             )->json();
 
-            $results = array_merge($results, $response['data'] ?? []);
+            $data = array_merge($data, $response['data'] ?? []);
+
+            if ($this->pageIsTruncated($response, 'estimated_times', $chunk, ['start_on' => $startOn, 'end_on' => $endOn])) {
+                $truncated = array_merge($truncated, $chunk);
+            }
         }
 
-        return $results;
+        return ['data' => $data, 'truncated_ids' => $truncated];
+    }
+
+    /** Sólo los datos; si la respuesta vino truncada queda un warning en el log. */
+    public function getEstimatedTimes(array $employeeIds, string $startOn, string $endOn): array
+    {
+        return $this->fetchEstimatedTimes($employeeIds, $startOn, $endOn)['data'];
+    }
+
+    private function pageIsTruncated(mixed $response, string $endpoint, array $chunk, array $context = []): bool
+    {
+        $meta = is_array($response) ? ($response['meta'] ?? []) : [];
+
+        if (!is_array($meta) || !filter_var($meta['has_next_page'] ?? false, FILTER_VALIDATE_BOOLEAN)) {
+            return false;
+        }
+
+        Log::warning("FactorialService: {$endpoint} devolvió has_next_page=true — sólo se leyó la primera página, lote tratado como incompleto", array_merge([
+            'connection_id' => $this->connection->id,
+            'empleados'     => count($chunk),
+            'filas'         => is_array($response['data'] ?? null) ? count($response['data']) : null,
+        ], $context));
+
+        return true;
     }
 }

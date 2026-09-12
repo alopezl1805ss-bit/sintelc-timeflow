@@ -5,17 +5,38 @@ namespace App\Jobs;
 use App\Models\AttendanceLog;
 use App\Models\FactorialConnection;
 use App\Models\FactorialEmployee;
+use App\Services\AttendanceEmployeeGuard;
 use App\Services\FactorialService;
+use Carbon\Carbon;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Queue\Queueable;
 use Illuminate\Http\Client\RequestException;
 use Illuminate\Support\Facades\Log;
 
+/**
+ * Envía un marcaje a Factorial.
+ *
+ * Principio (D1 «Nómina», 2026-09-12): contener, no adivinar. Si el fallback no
+ * puede decidir con certeza qué quería decir un marcaje, NO escribe en Factorial:
+ * marca el registro `failed` con una nota que dice qué turno lo bloquea y desde
+ * cuándo. Un fallo visible es recuperable; un turno corrido en silencio es
+ * nómina mal pagada.
+ */
 class SyncAttendanceToFactorial implements ShouldQueue
 {
     use Queueable;
 
     public int $tries  = 1;
+
+    /**
+     * Techo duro de attendance.max_shift_hours. updateShift() sólo manda la
+     * HORA (H:i:s): Factorial interpreta una salida con hora menor que la
+     * entrada como «día siguiente». Eso sólo es inequívoco por debajo de 24 h.
+     */
+    private const MAX_SHIFT_HOURS_CEILING = 23;
+
+    /** true en cuanto este intento dejó el registro en synced o failed (H02). */
+    private bool $settled = false;
 
     public function __construct(
         public readonly int $attendanceLogId
@@ -37,6 +58,14 @@ class SyncAttendanceToFactorial implements ShouldQueue
             return;
         }
 
+        // Guardarraíl H01 dentro del job: cubre TODAS las vías de despacho
+        // (ingesta en caliente ATTLOG/rtlog, CSV, resolve, tablero), no sólo
+        // las que ya lo llamaban antes de despachar.
+        if (!AttendanceEmployeeGuard::canDispatch($log, 'SyncAttendanceToFactorial')) {
+            $this->fail($log, "Guardarraíl H01: el empleado {$log->factorial_employee_id} no pertenece al cliente {$log->client_id} de este registro; no se envió a Factorial");
+            return;
+        }
+
         $employee = FactorialEmployee::find($log->factorial_employee_id);
         if (!$employee) {
             $this->fail($log, "No se encontró factorial_employee_id: {$log->factorial_employee_id}");
@@ -55,7 +84,20 @@ class SyncAttendanceToFactorial implements ShouldQueue
         }
 
         $service = new FactorialService($connection);
-        $this->sync($log, $employee, $service);
+
+        // H02: todo camino termina en fail() o markSynced(). Cualquier excepción
+        // que no haya dejado ya un estado final (ConnectionException, refresco
+        // OAuth fallido, un GET dentro del fallback…) marca `failed` antes de
+        // propagarse; antes el registro se quedaba `resolved` para siempre,
+        // invisible en el tablero.
+        try {
+            $this->sync($log, $employee, $service);
+        } catch (\Throwable $e) {
+            if (!$this->settled) {
+                $this->fail($log, 'Error inesperado: ' . $this->describe($e));
+            }
+            throw $e;
+        }
     }
 
     // ── Flujo principal ────────────────────────────────────────────
@@ -80,32 +122,41 @@ class SyncAttendanceToFactorial implements ShouldQueue
                 'check_out', 'break_in' => $service->clockOut($payload),
                 default                 => null,
             };
-
-            if ($response === null) {
-                $this->fail($log, "check_type no soportado: {$log->check_type}");
-                return;
-            }
-
-            $shiftId = $response['id'] ?? null;
-            if (!$shiftId) {
-                // La respuesta llegó pero sin ID — verificar si Factorial igualmente creó el turno
-                $existing = $this->findMatchingShift($service, $employee->factorial_id, $log);
-                if ($existing) {
-                    $this->markSynced($log, $existing['id'], 'idempotente - turno confirmado sin ID en respuesta');
-                    return;
-                }
-                $this->fail($log, 'Factorial no devolvió ID de turno en la respuesta directa');
-                return;
-            }
-
-            $this->markSynced($log, $shiftId, 'directo');
-
         } catch (RequestException $e) {
-            $message = $this->extractErrorMessage($e);
+            $this->fallback($log, $employee, $service, $e);
+            return;
+        }
 
-            // Antes de intentar overwrite, verificar idempotencia:
-            // el job pudo haber creado el turno en Factorial en una ejecución anterior
-            // pero fallar antes de actualizar nuestra DB.
+        if ($response === null) {
+            $this->fail($log, "check_type no soportado: {$log->check_type}");
+            return;
+        }
+
+        $shiftId = $response['id'] ?? null;
+        if (!$shiftId) {
+            // La respuesta llegó pero sin ID — verificar si Factorial igualmente creó el turno
+            $existing = $this->findMatchingShift($service, $employee->factorial_id, $log);
+            if ($existing) {
+                $this->markSynced($log, $existing['id'], 'idempotente - turno confirmado sin ID en respuesta');
+                return;
+            }
+            $this->fail($log, 'Factorial no devolvió ID de turno en la respuesta directa');
+            return;
+        }
+
+        $this->markSynced($log, $shiftId, 'directo');
+    }
+
+    /**
+     * El método directo fue rechazado. Primero idempotencia (el job pudo haber
+     * creado el turno en un intento anterior que murió antes de guardar), luego
+     * el overwrite del turno abierto. Cualquier excepción aquí termina en fail().
+     */
+    private function fallback(AttendanceLog $log, FactorialEmployee $employee, FactorialService $service, RequestException $e): void
+    {
+        $primaryError = $this->extractErrorMessage($e);
+
+        try {
             $existing = $this->findMatchingShift($service, $employee->factorial_id, $log);
             if ($existing) {
                 $this->markSynced($log, $existing['id'], 'idempotente - turno ya existía en Factorial');
@@ -115,219 +166,207 @@ class SyncAttendanceToFactorial implements ShouldQueue
             Log::warning('SyncAttendanceToFactorial: método directo falló, intentando overwrite', [
                 'attendance_log_id' => $log->id,
                 'http_status'       => $e->response->status(),
-                'error'             => $message,
+                'error'             => $primaryError,
             ]);
 
-            $this->tryOverwrite($log, $employee, $service, $message);
+            $this->tryOverwrite($log, $employee, $service, $primaryError);
 
-        } catch (\Throwable $e) {
-            // Solo marcar como fallido si el sync no había completado ya.
-            // Evita que errores de logging (permisos) sobrescriban un status synced.
-            $log->refresh();
-            if ($log->sync_status !== 'synced') {
-                $this->fail($log, $e->getMessage());
+        } catch (\Throwable $t) {
+            if (!$this->settled) {
+                $this->fail($log, "Directo: {$primaryError} | Fallback: {$this->describe($t)}");
             }
-            throw $e;
+            throw $t;
         }
     }
 
-    // ── Fallback: sobreescribir turno existente ────────────────────
+    // ── Fallback: sobreescribir el turno abierto ───────────────────
     //
-    // La API tiene mayor jerarquía que la plataforma web/móvil.
-    // Si hay un turno abierto (sea cual sea su in_source), lo sobreescribimos
-    // con el timestamp del biométrico.
+    // El biométrico tiene prioridad sobre cualquier turno abierto sea cual sea
+    // su in_source (API, web, móvil) — pero sólo dentro de reglas que no
+    // adivinan (D1, riesgos R02/R03):
+    //   · el turno abierto se busca con el endpoint nativo open_shifts, sea de
+    //     la fecha que sea, y sólo se toca si su clock_in está a menos de
+    //     attendance.max_shift_hours del marcaje;
+    //   · una entrada nunca mueve el clock_in hacia más tarde (la primera
+    //     entrada gana); sí puede adelantarlo dentro del mismo día;
+    //   · una salida nunca cierra un turno que empezó después de ella.
+    // El antiguo tercer fallback (corregir un turno YA CERRADO) está
+    // desactivado para todos los tipos: elegía el candidato con first() sin
+    // orden ni verificación de solapes y, para entradas, escribía un clock_in
+    // posterior al clock_out.
 
     private function tryOverwrite(AttendanceLog $log, FactorialEmployee $employee, FactorialService $service, string $primaryError): void
     {
-        try {
-            // Buscar turno abierto del empleado en la fecha del registro
-            // También revisamos el día anterior por si el turno cruzó medianoche
-            $openShift = $this->findOpenShift($service, $employee->factorial_id, $log->occurred_at);
+        $isEntry = in_array($log->check_type, ['check_in', 'break_out'], true);
+        $isExit  = in_array($log->check_type, ['check_out', 'break_in'], true);
 
-            if (!$openShift) {
-                // Fallback: si no hay turno abierto, buscar uno cerrado ese mismo día
-                // cuyo clock_out haya sido anterior al ponche real — indica que Factorial
-                // cerró el turno de más temprano (ej. por horario/contrato, o por break mal cerrado).
-                // Correger el clock_out a la hora real es más preciso que fallar.
-                $closedShift = $this->findClosedShiftToCorrect($service, $employee->factorial_id, $log->occurred_at, $log->check_type);
-                if ($closedShift) {
-                    $this->correctClosedShift($log, $employee, $service, $closedShift);
-                    return;
-                }
-
-                $this->fail($log, "Sin turno abierto para sobreescribir. Error original: {$primaryError}");
-                return;
-            }
-
-            // El biométrico tiene prioridad sobre cualquier turno abierto,
-            // independientemente de su origen (API, biométrico, web, app).
-            // null                → creado vía API/biométrico → SÍ permitir
-            // desktop             → web de Factorial          → SÍ permitir
-            // mobile              → app móvil Factorial       → SÍ permitir
-            // mobile_geolocation  → app móvil con geoloc.     → SÍ permitir
-            $inSource = $openShift['in_source'] ?? 'api/biométrico';
-
-            // Si el turno ya fue editado por nuestro biométrico para este mismo
-            // tipo de operación, no volvemos a tocarlo — el segundo fichaje es
-            // un doble-golpe en el equipo y no debe sobreescribir el primero.
-            $marker       = "Editado por biométrico SFT: {$log->check_type}";
-            $observations = $openShift['observations'] ?? '';
-            if (str_contains((string) $observations, $marker)) {
-                $this->fail($log, "Turno ya editado por biométrico SFT para {$log->check_type}. Error original: {$primaryError}");
-                return;
-            }
-
-            $time = $log->occurred_at->format('H:i:s');
-
-            $updatePayload = match ($log->check_type) {
-                'check_in', 'break_out' => ['clock_in'  => $time],
-                'check_out', 'break_in' => ['clock_out' => $time],
-                default                 => null,
-            };
-
-            if ($updatePayload === null) {
-                $this->fail($log, "check_type no soportado: {$log->check_type}");
-                return;
-            }
-
-            $updatePayload['observations'] = $marker;
-
-            $updated = $service->updateShift($openShift['id'], $updatePayload);
-
-            $confirmedId = $updated['id'] ?? null;
-            if (!$confirmedId) {
-                $this->fail($log, "Factorial no confirmó la actualización del turno {$openShift['id']}");
-                return;
-            }
-
-            $this->markSynced($log, $confirmedId, "overwrite ({$inSource})");
-
-            Log::info('SyncAttendanceToFactorial: OK (overwrite)', [
-                'attendance_log_id'  => $log->id,
-                'check_type'         => $log->check_type,
-                'factorial_shift_id' => $openShift['id'],
-                'in_source'          => $inSource,
-            ]);
-
-        } catch (RequestException $e) {
-            $message = $this->extractErrorMessage($e);
-
-            $this->fail($log, "Directo: {$primaryError} | Overwrite: {$message}");
-            throw $e;
-
-        } catch (\Throwable $e) {
-            $this->fail($log, "Directo: {$primaryError} | Overwrite: {$e->getMessage()}");
-            throw $e;
+        if (!$isEntry && !$isExit) {
+            $this->fail($log, "check_type no soportado: {$log->check_type}");
+            return;
         }
-    }
 
-    // ── Fallback: corregir turno cerrado de más temprano ────────────────────
+        $factorialId = (int) $employee->factorial_id;
+        $open        = $service->fetchOpenShifts([$factorialId]);
 
-    /**
-     * Busca un turno cerrado en la misma fecha (o la anterior, si es nocturno)
-     * cuyo clock_out sea anterior a la hora del ponche real.
-     *
-     * Detecta turnos que Factorial cerró antes de tiempo (p.ej. por horario/contrato,
-     * o por un break sin cierre real), y que la entrada/salida real llegó después.
-     */
-    private function findClosedShiftToCorrect(FactorialService $service, int $factorialEmployeeId, \Carbon\Carbon $logTime, string $checkType): ?array
-    {
-        // Para check_out: buscar un turno cuyo clock_out sea anterior a la hora real
-        // (es decir, ya cerrado cuando la salida debería haber sido después).
-        // Para check_in: buscar un turno del día anterior (turno nocturno cerrado antes del check_in real).
-        $field      = in_array($checkType, ['check_out', 'break_in']) ? 'clock_out' : 'clock_in';
-        $targetDate = $logTime->format('Y-m-d');
-        $logTimeStr = $logTime->format('H:i');
+        if ($open['truncated_ids'] !== []) {
+            $this->fail($log, "open_shifts devolvió una respuesta truncada para el empleado: no se puede saber qué turno está abierto; revisar. Error original: {$primaryError}");
+            return;
+        }
 
-        // Buscar en el mismo día
-        $shifts = $service->getShifts([
-            'employee_ids' => [$factorialEmployeeId],
-            'start_on'     => $targetDate,
-            'end_on'       => $targetDate,
+        $shifts = collect($open['data'])
+            ->filter(fn ($s) => (int) ($s['employee_id'] ?? 0) === $factorialId)
+            ->values();
+
+        if ($shifts->isEmpty()) {
+            $this->fail($log, "Sin turno abierto para sobreescribir. Error original: {$primaryError}");
+            return;
+        }
+
+        if ($shifts->count() > 1) {
+            $ids = $shifts->pluck('id')->implode(', ');
+            $this->fail($log, "Varios turnos abiertos a la vez ({$ids}): no se elige uno a ciegas; revisar. Error original: {$primaryError}");
+            return;
+        }
+
+        $shift     = $shifts->first();
+        $clockInAt = $this->shiftClockIn($shift);
+
+        if (!$clockInAt) {
+            $this->fail($log, "El turno abierto {$shift['id']} no trae clock_in legible; revisar. Error original: {$primaryError}");
+            return;
+        }
+
+        $punchAt    = $log->occurred_at;
+        $elapsedSec = $punchAt->getTimestamp() - $clockInAt->getTimestamp(); // > 0: marcaje posterior a la entrada del turno
+        $since      = $clockInAt->format('Y-m-d H:i');
+
+        // R02: turno de otro día laboral. No se cierra ni se mueve con este
+        // marcaje (crearía un turno de varios días). Lo cierra el cierre
+        // automático o una persona.
+        if (abs($elapsedSec) > $this->maxShiftHours() * 3600) {
+            $hours = intdiv(abs($elapsedSec), 3600);
+            $this->fail($log, "Turno abierto desde {$since} ({$hours} h) bloquea este marcaje: revisar. Turno Factorial {$shift['id']}. Error original: {$primaryError}");
+            return;
+        }
+
+        if ($isEntry) {
+            $sameMinute = $clockInAt->format('Y-m-d H:i') === $punchAt->format('Y-m-d H:i');
+
+            if ($sameMinute) {
+                // El turno ya refleja esta entrada: nada que escribir.
+                $this->markSynced($log, (int) $shift['id'], 'idempotente - entrada ya registrada en el turno abierto');
+                return;
+            }
+
+            if ($elapsedSec > 0) {
+                // R03: una entrada nunca mueve el clock_in hacia más tarde.
+                // Con etiquetas invertidas (EPRECSA) es una salida marcada como
+                // entrada; tiene que verse, no descartarse.
+                $shown = $clockInAt->isSameDay($punchAt) ? $clockInAt->format('H:i') : $since;
+                $this->fail($log, "Entrada posterior a la ya registrada ({$shown}); posible salida marcada como entrada. Turno Factorial {$shift['id']}. Error original: {$primaryError}");
+                return;
+            }
+
+            // Marcaje anterior: la primera entrada gana, pero sólo dentro del
+            // mismo día — updateShift() sólo lleva la hora, cambiar de fecha no
+            // se puede expresar.
+            if (!$clockInAt->isSameDay($punchAt)) {
+                $this->fail($log, "Entrada anterior a un turno abierto de otro día ({$since}): no se mueve de fecha; revisar. Turno Factorial {$shift['id']}. Error original: {$primaryError}");
+                return;
+            }
+        } elseif ($elapsedSec <= 0) {
+            $this->fail($log, "Salida anterior al inicio del turno abierto ({$since}): no se cierra un turno antes de que empiece; revisar. Turno Factorial {$shift['id']}. Error original: {$primaryError}");
+            return;
+        }
+
+        $shift = $this->withShiftDetails($service, $factorialId, $shift);
+
+        // Si el turno ya fue editado por nuestro biométrico para este mismo
+        // tipo de operación, no volvemos a tocarlo — el segundo fichaje es
+        // un doble-golpe en el equipo y no debe sobreescribir el primero.
+        $marker = "Editado por biométrico SFT: {$log->check_type}";
+        if (str_contains((string) ($shift['observations'] ?? ''), $marker)) {
+            $this->fail($log, "Turno ya editado por biométrico SFT para {$log->check_type}. Error original: {$primaryError}");
+            return;
+        }
+
+        $time          = $punchAt->format('H:i:s');
+        $updatePayload = $isEntry ? ['clock_in' => $time] : ['clock_out' => $time];
+        $updatePayload['observations'] = $marker;
+
+        $updated     = $service->updateShift((int) $shift['id'], $updatePayload);
+        $confirmedId = $updated['id'] ?? null;
+
+        if (!$confirmedId) {
+            $this->fail($log, "Factorial no confirmó la actualización del turno {$shift['id']}");
+            return;
+        }
+
+        $inSource = $shift['in_source'] ?? 'api/biométrico';
+        $this->markSynced($log, (int) $confirmedId, "overwrite ({$inSource})");
+
+        Log::info('SyncAttendanceToFactorial: OK (overwrite)', [
+            'attendance_log_id'  => $log->id,
+            'check_type'         => $log->check_type,
+            'factorial_shift_id' => $shift['id'],
+            'shift_clock_in'     => $since,
+            'in_source'          => $inSource,
         ]);
-
-        $candidate = collect($shifts)->filter(
-            fn($s) => (int) $s['employee_id'] === $factorialEmployeeId
-                   && $s['date'] === $targetDate
-                   && $s['clock_out'] !== null  // debe estar cerrado
-                   && substr($s['clock_out'] ?? '', 0, 5) < $logTimeStr  // clock_out antes de la hora real
-        )->first();
-
-        if ($candidate) return $candidate;
-
-        // Para turnos nocturnos (check_in madrugada del 17, pero el turno empezó el 16):
-        // buscar turno del día anterior cuyo clock_out sea de madrugada.
-        if (in_array($checkType, ['check_in', 'break_out']) && (int) substr($logTimeStr, 0, 2) < 6) {
-            $prevDate = $logTime->copy()->subDay()->format('Y-m-d');
-            $shifts = $service->getShifts([
-                'employee_ids' => [$factorialEmployeeId],
-                'start_on'     => $prevDate,
-                'end_on'       => $prevDate,
-            ]);
-
-            return collect($shifts)->filter(
-                fn($s) => (int) $s['employee_id'] === $factorialEmployeeId
-                       && $s['date'] === $prevDate
-                       && $s['clock_out'] !== null
-                       && substr($s['clock_out'] ?? '', 0, 5) >= '20:00'  // cerrado de noche
-            )->first();
-        }
-
-        return null;
-    }
-
-    /**
-     * Corrige un turno cerrado de más temprano, actualizando el clock_out
-     * (o clock_in para break_out) a la hora real del ponche.
-     */
-    private function correctClosedShift(AttendanceLog $log, FactorialEmployee $employee, FactorialService $service, array $shift): void
-    {
-        try {
-            $time = $log->occurred_at->format('H:i:s');
-
-            $updatePayload = match ($log->check_type) {
-                'check_in', 'break_out' => ['clock_in'  => $time],
-                'check_out', 'break_in' => ['clock_out' => $time],
-                default                 => null,
-            };
-
-            if ($updatePayload === null) {
-                $this->fail($log, "check_type no soportado: {$log->check_type}");
-                return;
-            }
-
-            $marker = "Editado por biométrico SFT: {$log->check_type}";
-            $updatePayload['observations'] = $marker;
-
-            $updated = $service->updateShift($shift['id'], $updatePayload);
-            $confirmedId = $updated['id'] ?? null;
-
-            if (!$confirmedId) {
-                $this->fail($log, "Factorial no confirmó la corrección del turno {$shift['id']}");
-                return;
-            }
-
-            $this->markSynced($log, $confirmedId, "corregido (turno cerrado de más temprano)");
-
-            Log::info('SyncAttendanceToFactorial: OK (corrección de cierre anticipado)', [
-                'attendance_log_id'  => $log->id,
-                'check_type'         => $log->check_type,
-                'factorial_shift_id' => $shift['id'],
-                'original_time'      => $shift[$log->check_type === 'check_out' ? 'clock_out' : 'clock_in'],
-                'corrected_time'     => $time,
-            ]);
-
-        } catch (RequestException $e) {
-            $message = $this->extractErrorMessage($e);
-            $this->fail($log, "No se pudo corregir el turno cerrado de más temprano: {$message}");
-            throw $e;
-        } catch (\Throwable $e) {
-            $this->fail($log, "Error corrigiendo turno: {$e->getMessage()}");
-            throw $e;
-        }
     }
 
     // ── Helpers ────────────────────────────────────────────────────
+
+    private function maxShiftHours(): int
+    {
+        return min(max((int) config('attendance.max_shift_hours', 20), 1), self::MAX_SHIFT_HOURS_CEILING);
+    }
+
+    /**
+     * Fecha y hora de entrada de un turno. open_shifts devuelve clock_in como
+     * datetime ISO con fecha ficticia ("2000-01-01T08:00:00.000Z") y la fecha
+     * real en `date`; shifts lo devuelve como "08:00:00". Mismo criterio que
+     * CloseForgottenShifts: la hora se toma tal cual, como hora local.
+     */
+    private function shiftClockIn(array $shift): ?Carbon
+    {
+        $date = $shift['date'] ?? null;
+        $raw  = (string) ($shift['clock_in'] ?? '');
+
+        if (!$date || $raw === '') return null;
+
+        $timePart = str_contains($raw, 'T') ? substr($raw, strpos($raw, 'T') + 1) : $raw;
+
+        if (!preg_match('/^(\d{2}):(\d{2})(?::(\d{2}))?/', $timePart, $m)) return null;
+
+        try {
+            return Carbon::parse(sprintf('%s %s:%s:%s', $date, $m[1], $m[2], $m[3] ?? '00'));
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /**
+     * open_shifts no garantiza traer `observations`/`in_source` (la forma que
+     * usan las pruebas del cierre automático no los trae). Sin `observations`
+     * la marca «Editado por biométrico SFT» no se podría comprobar, así que se
+     * completa con el turno de `shifts` de esa fecha, sólo si falta la clave.
+     */
+    private function withShiftDetails(FactorialService $service, int $factorialEmployeeId, array $shift): array
+    {
+        if (array_key_exists('observations', $shift) || empty($shift['date'])) {
+            return $shift;
+        }
+
+        $full = collect($service->getShifts([
+            'employee_ids' => [$factorialEmployeeId],
+            'start_on'     => $shift['date'],
+            'end_on'       => $shift['date'],
+        ]))->first(fn ($s) => (int) ($s['id'] ?? 0) === (int) $shift['id']);
+
+        return $full
+            ? array_merge($shift, array_intersect_key($full, array_flip(['observations', 'in_source'])))
+            : $shift;
+    }
 
     /**
      * Extrae un mensaje legible del error que devuelve Factorial.
@@ -349,14 +388,15 @@ class SyncAttendanceToFactorial implements ShouldQueue
             ?? $e->getMessage();
     }
 
-    /**
-     * Busca un turno sin clock_out en la fecha exacta del log.
-     * Solo se revisa el día del registro — nunca días anteriores.
-     *
-     * NOTA: la API de Factorial ignora los query params employee_id y date,
-     * devuelve todos los turnos de la empresa. Filtramos en PHP para garantizar
-     * que solo tocamos turnos del empleado correcto en la fecha correcta.
-     */
+    private function describe(\Throwable $e): string
+    {
+        if ($e instanceof RequestException) {
+            return $this->extractErrorMessage($e);
+        }
+
+        return class_basename($e) . ': ' . $e->getMessage();
+    }
+
     /**
      * Verifica si Factorial ya tiene un turno que coincida con el tiempo del log.
      * Usado para idempotencia: detecta el caso en que el job creó el turno en Factorial
@@ -385,26 +425,6 @@ class SyncAttendanceToFactorial implements ShouldQueue
         );
     }
 
-    private function findOpenShift(FactorialService $service, int $factorialEmployeeId, \Carbon\Carbon $date): ?array
-    {
-        $targetDate = $date->format('Y-m-d');
-
-        $shifts = $service->getShifts([
-            'employee_ids' => [$factorialEmployeeId],
-            'start_on'     => $targetDate,
-            'end_on'       => $targetDate,
-        ]);
-
-        // Filtro defensivo: aunque la API devuelva más registros de los esperados,
-        // solo aceptamos turnos del empleado correcto en la fecha exacta.
-        // Si hay varios abiertos, tomamos el de clock_in más temprano.
-        return collect($shifts)->filter(
-            fn($s) => $s['clock_out'] === null
-                   && (int) $s['employee_id'] === $factorialEmployeeId
-                   && $s['date'] === $targetDate
-        )->sortBy('clock_in')->first();
-    }
-
     private function markSynced(AttendanceLog $log, ?int $shiftId, string $note): void
     {
         $log->update([
@@ -414,6 +434,7 @@ class SyncAttendanceToFactorial implements ShouldQueue
             'sync_error'         => null,
             'sync_note'          => $note,
         ]);
+        $this->settled = true;
 
         Log::info('SyncAttendanceToFactorial: OK', [
             'attendance_log_id'  => $log->id,
@@ -426,6 +447,7 @@ class SyncAttendanceToFactorial implements ShouldQueue
     private function fail(AttendanceLog $log, string $error): void
     {
         $log->update(['sync_status' => 'failed', 'sync_error' => $error]);
+        $this->settled = true;
 
         Log::error('SyncAttendanceToFactorial: FAILED', [
             'attendance_log_id' => $log->id,
