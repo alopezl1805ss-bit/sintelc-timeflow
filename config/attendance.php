@@ -95,4 +95,43 @@ return [
         21,  // ACERMEX
     ],
 
+    /*
+    |--------------------------------------------------------------------------
+    | Duración máxima de un turno que el fallback puede tocar (horas)
+    |--------------------------------------------------------------------------
+    |
+    | Cuando Factorial rechaza el marcaje directo, SyncAttendanceToFactorial
+    | busca el turno abierto del empleado (open_shifts, sea de la fecha que
+    | sea). Sólo lo cierra o lo adelanta si su clock_in está a menos de estas
+    | horas del marcaje. Un turno más viejo NO se toca: el registro queda
+    | `failed` con la nota «Turno abierto desde … bloquea este marcaje» (cerrarlo
+    | crearía un turno de varios días). 20 h cubre un turno nocturno de 12 h con
+    | holgura. Techo duro de 23 h en el job: updateShift() sólo manda la hora.
+    |
+    */
+
+    'max_shift_hours' => (int) env('ATTENDANCE_MAX_SHIFT_HOURS', 20),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Clientes con la sincronización retenida
+    |--------------------------------------------------------------------------
+    |
+    | ATTENDANCE_SYNC_HOLD_CLIENTS=15,20 (ids separados por comas; vacío por
+    | defecto). Sus marcajes se siguen recibiendo y guardando, pero el job los
+    | deja en `retenido` sin llamar a Factorial, y el cierre automático salta
+    | sus conexiones. Nada se pierde: al quitar el id de la lista (y correr
+    | config:cache) se liberan con
+    |   php artisan attendance:liberar-retenidos --client=<id>
+    |
+    | Motivo (2026-09-12): EPRECSA (#15) tiene Entrada/Salida invertidas en el
+    | equipo; cada día sincronizado crea turnos nocturnos fantasma en nómina.
+    |
+    */
+
+    'sync_hold_clients' => array_values(array_map('intval', array_filter(
+        array_map('trim', explode(',', (string) env('ATTENDANCE_SYNC_HOLD_CLIENTS', ''))),
+        fn ($v) => ctype_digit($v) && (int) $v > 0
+    ))),
+
 ];

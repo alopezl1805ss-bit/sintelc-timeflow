@@ -3,6 +3,7 @@
 namespace App\Console\Commands;
 
 use App\Jobs\CloseForgottenShiftJob;
+use App\Jobs\SyncAttendanceToFactorial;
 use App\Models\ClientAttendanceConfig;
 use App\Models\FactorialConnection;
 use App\Models\FactorialEmployee;
@@ -23,6 +24,10 @@ class CloseForgottenShifts extends Command
     // Usado cuando Factorial no tiene horas planificadas para ese día
     // (sin contrato con horario, o expected_minutes = 0 — ver nota en handle()).
     private const DEFAULT_SHIFT_MINUTES = 8 * 60;
+
+    // Empleados por llamada a estimated_times para UNA fecha (≤ 100 filas =
+    // una página). FactorialService además trocea a 80 por el límite de URI.
+    private const ESTIMATES_BATCH = 100;
 
     public function handle(): int
     {
@@ -45,6 +50,12 @@ class CloseForgottenShifts extends Command
             $config = $clientConfigs[$connection->client_id] ?? null;
             if (!$config) continue;
 
+            // Cliente retenido: el cierre también escribe en Factorial.
+            if (SyncAttendanceToFactorial::clientOnHold($connection->client_id)) {
+                $this->warn("Conexión #{$connection->id}: cliente {$connection->client_id} retenido (ATTENDANCE_SYNC_HOLD_CLIENTS), se salta.");
+                continue;
+            }
+
             $totalClosed += $this->processConnection($connection, $config);
         }
 
@@ -61,9 +72,10 @@ class CloseForgottenShifts extends Command
         if ($employees->isEmpty()) return 0;
 
         $service = new FactorialService($connection);
+        $employeesByFactorialId = $employees->keyBy('factorial_id');
 
         try {
-            $openShifts = $service->getOpenShifts($employees->pluck('factorial_id')->all());
+            $open = $service->fetchOpenShifts($employees->pluck('factorial_id')->all());
         } catch (\Throwable $e) {
             Log::error('attendance:close-forgotten-shifts: fallo al leer open_shifts', [
                 'connection_id' => $connection->id,
@@ -73,35 +85,65 @@ class CloseForgottenShifts extends Command
             return 0;
         }
 
-        if (empty($openShifts)) return 0;
+        // Lote de open_shifts truncado (has_next_page=true): para esos
+        // empleados no sabemos qué turnos faltan — no se cierra a ninguno en
+        // esta corrida; se reintenta a la hora siguiente.
+        $skipEmployees = array_fill_keys(array_map('intval', $open['truncated_ids']), true);
 
-        // Rango de fechas cubierto por los turnos abiertos encontrados, para
-        // pedir estimated_times de una sola vez por conexión (no por turno).
-        $dates = collect($openShifts)->pluck('date')->filter()->unique()->sort();
-        if ($dates->isEmpty()) return 0;
+        $openShifts = collect($open['data'])->filter(function ($shift) use ($employeesByFactorialId, $skipEmployees) {
+            $id = (int) ($shift['employee_id'] ?? 0);
 
-        try {
-            $estimatedTimes = $service->getEstimatedTimes(
-                $employees->pluck('factorial_id')->all(),
-                $dates->first(),
-                $dates->last()
-            );
-        } catch (\Throwable $e) {
-            Log::error('attendance:close-forgotten-shifts: fallo al leer estimated_times', [
-                'connection_id' => $connection->id,
-                'error'         => $e->getMessage(),
-            ]);
-            $this->error("Conexión #{$connection->id}: error al leer estimated_times — {$e->getMessage()}");
-            return 0;
+            return isset($employeesByFactorialId[$id]) && !isset($skipEmployees[$id]) && !empty($shift['date']);
+        })->values();
+
+        if ($openShifts->isEmpty()) return 0;
+
+        // R01: estimated_times SÓLO de quien tiene turno abierto y agrupado
+        // por la fecha de su turno. Una fecha × ≤ 80 empleados (lote de
+        // FactorialService) = ≤ 80 filas = una sola página. Antes se pedía
+        // para todos los activos en el rango min..max de todos los turnos
+        // abiertos, lo que garantizaba el truncado y los cierres falsos de 8 h.
+        $estimatedByKey = [];
+        $undecided      = []; // "empleado_fecha" cuya estimación no se pudo leer completa
+
+        foreach ($openShifts->groupBy('date') as $date => $shiftsOfDate) {
+            $ids = $shiftsOfDate->pluck('employee_id')->map(fn ($id) => (int) $id)->unique()->values()->all();
+
+            foreach (array_chunk($ids, self::ESTIMATES_BATCH) as $batch) {
+                try {
+                    $estimates = $service->fetchEstimatedTimes($batch, $date, $date);
+                } catch (\Throwable $e) {
+                    Log::error('attendance:close-forgotten-shifts: fallo al leer estimated_times, no se cierra ese lote', [
+                        'connection_id' => $connection->id,
+                        'date'          => $date,
+                        'empleados'     => count($batch),
+                        'error'         => $e->getMessage(),
+                    ]);
+                    $this->error("Conexión #{$connection->id}: error al leer estimated_times del {$date} — {$e->getMessage()}");
+                    foreach ($batch as $id) $undecided[$id . '_' . $date] = true;
+                    continue;
+                }
+
+                foreach ($estimates['data'] as $row) {
+                    $estimatedByKey[($row['employee_id'] ?? '') . '_' . ($row['date'] ?? '')] = $row;
+                }
+
+                foreach ($estimates['truncated_ids'] as $id) {
+                    $undecided[(int) $id . '_' . $date] = true;
+                }
+            }
         }
 
-        $estimatedByKey = collect($estimatedTimes)->keyBy(
-            fn($t) => $t['employee_id'] . '_' . $t['date']
-        );
+        if ($skipEmployees !== [] || $undecided !== []) {
+            Log::warning('attendance:close-forgotten-shifts: respuesta incompleta de Factorial, esos empleados no se cierran en esta corrida', [
+                'connection_id'                 => $connection->id,
+                'empleados_open_shifts_trunc'   => count($skipEmployees),
+                'empleado_fecha_sin_estimacion' => count($undecided),
+            ]);
+        }
 
-        $employeesByFactorialId = $employees->keyBy('factorial_id');
-        $now     = Carbon::now();
-        $closed  = 0;
+        $now    = Carbon::now();
+        $closed = 0;
 
         foreach ($openShifts as $shift) {
             $factorialEmployeeId = (int) ($shift['employee_id'] ?? 0);
@@ -118,6 +160,12 @@ class CloseForgottenShifts extends Command
                 continue;
             }
 
+            // Estimación ilegible o truncada: no se adivina, se reintenta luego.
+            if (isset($undecided[$factorialEmployeeId . '_' . $date])) continue;
+
+            // Respuesta COMPLETA sin fila para el empleado: comportamiento
+            // documentado en CLAUDE.md (8 h por defecto, sin_horario). Para
+            // checkin_only no cerrar nunca reintroduciría el bloqueo open_shift.
             $estimate       = $estimatedByKey[$factorialEmployeeId . '_' . $date] ?? null;
             $expectedMinutes = (int) ($estimate['expected_minutes'] ?? 0);
 

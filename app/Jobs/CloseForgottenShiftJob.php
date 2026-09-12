@@ -66,6 +66,18 @@ class CloseForgottenShiftJob implements ShouldQueue
             return;
         }
 
+
+        // Revisión D1 (R1): un cierre que ya estaba en cola cuando se retuvo al
+        // cliente no debe escribir en Factorial. El comando ya salta a los
+        // retenidos al encolar; esto cubre lo encolado antes de retenerlo.
+        if (SyncAttendanceToFactorial::clientOnHold($connection->client_id)) {
+            Log::warning('CloseForgottenShiftJob: cliente retenido, no se toca el turno', [
+                'client_id' => $connection->client_id,
+                'shift_id'  => $this->shiftId,
+            ]);
+            return;
+        }
+
         $service = new FactorialService($connection);
 
         // Idempotencia: confirmar que el turno SIGUE abierto antes de tocarlo.

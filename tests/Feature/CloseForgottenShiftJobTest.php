@@ -198,4 +198,27 @@ class CloseForgottenShiftJobTest extends TestCase
             'active'                  => true,
         ]);
     }
+
+    public function test_no_toca_el_turno_si_el_cliente_esta_retenido(): void
+    {
+        $employee = $this->makeEmployee();
+        $clientId = FactorialConnection::find($employee->factorial_connection_id)->client_id;
+        config(['attendance.sync_hold_clients' => [$clientId]]);
+
+        // Sin la retención, el job vería el turno 900 abierto y lo cerraría con un PUT.
+        Http::fake(fn (Request $request) => Http::response(['data' => [[
+            'id' => 900, 'employee_id' => $employee->factorial_id, 'clock_in' => '2026-08-10T09:00:00Z',
+        ]]], 200));
+
+        (new CloseForgottenShiftJob(
+            factorialEmployeeId: $employee->id,
+            shiftId: 900,
+            closeAt: '2026-08-10 17:00:00',
+            checkinOnly: true,
+            reason: 'con_horario',
+        ))->handle();
+
+        Http::assertNothingSent();
+        $this->assertSame(0, AttendanceLog::count());
+    }
 }
